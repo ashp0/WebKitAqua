@@ -373,10 +373,10 @@ int main(void)
         }
 
         static const struct { const char *name; Scene scene; } scenes[] = {
-            { "rotated, scaled, elliptical clip", { false, false, false, false, kCGBlendModeNormal, 0, NULL } },
-            { "multiply under global alpha 0.6", { false, false, false, false, kCGBlendModeMultiply, 0.6, NULL } },
-            { "shadow", { false, false, true, false, kCGBlendModeNormal, 0, NULL } },
-            { "transparency layer under global alpha 0.6", { false, false, false, true, kCGBlendModeNormal, 0.6, NULL } },
+            { "rotated, scaled, elliptical clip", { false, false, false, false, kCGBlendModeNormal, 0, NULL, false } },
+            { "multiply under global alpha 0.6", { false, false, false, false, kCGBlendModeMultiply, 0.6, NULL, false } },
+            { "shadow", { false, false, true, false, kCGBlendModeNormal, 0, NULL, false } },
+            { "transparency layer under global alpha 0.6", { false, false, false, true, kCGBlendModeNormal, 0.6, NULL, false } },
         };
         for (size_t i = 0; i < sizeof(scenes) / sizeof(scenes[0]); i++) {
             for (int concentric = 0; concentric < 2; concentric++) {
@@ -389,7 +389,7 @@ int main(void)
             }
         }
         for (int concentric = 0; concentric < 2; concentric++) {
-            Scene scene = { concentric, false, false, false, kCGBlendModeNormal, 0, gLinear };
+            Scene scene = { concentric, false, false, false, kCGBlendModeNormal, 0, gLinear, false };
             char name[120];
             snprintf(name, sizeof(name), "linear-sRGB gradient, %s", concentric ? "concentric" : "offset");
             checkRoute(scene, name);
@@ -403,7 +403,7 @@ int main(void)
         for (size_t i = 0; i < kDestructiveModeCount; i++) {
             char name[120];
             snprintf(name, sizeof(name), "%s, partial coverage, surface", kDestructiveModes[i].name);
-            Scene partial = { true, true, false, false, kDestructiveModes[i].mode, 0, NULL };
+            Scene partial = { true, true, false, false, kDestructiveModes[i].mode, 0, NULL, false };
             checkRoute(partial, name);
             checkScene(partial, name, false, 0, 2);
 
@@ -489,7 +489,7 @@ int main(void)
             bool same = true;
             for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
                 Target ours = createTarget(false, kSide, kSide, gSRGB), stock = createTarget(false, kSide, kSide, gSRGB);
-                Scene scene = { true, false, true, false, modes[i], 0, gLinear };
+                Scene scene = { true, false, true, false, modes[i], 0, gLinear, false };
                 drawScene(ours.context, scene, CGContextDrawRadialGradient);
                 drawScene(stock.context, scene, gSystem);
                 readTarget(&ours);

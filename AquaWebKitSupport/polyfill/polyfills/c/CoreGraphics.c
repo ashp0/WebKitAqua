@@ -2547,8 +2547,6 @@ static bool wk_drawOversizedImageInIOSurface(CGContextRef, CGRect, CGImageRef);
 static CGImageRef wk_copyImageForDraw(CGContextRef, CGRect, CGImageRef, CGColorSpaceRef);
 static const void *wk_imageSurfaceKey(void);
 static bool wk_drawSurfaceImageShownPart(CGContextRef, CGRect, CGImageRef);
-static bool wk_beginStyledDraw(CGContextRef, CGBlendMode, bool, wk_blend_read_back *, CGRect);
-static void wk_endStyledDraw(wk_blend_read_back *);
 static bool wk_insideOffscreenSurfaceLayer(CGContextRef);
 extern void CGContextSetCTM(CGContextRef, CGAffineTransform);
 static IOSurfaceRef wk_createBGRASurface(size_t width, size_t height);
@@ -2893,27 +2891,105 @@ static CGImageRef wk_createImagePartOverBytes(CGImageRef image, double left, dou
     return part;
 }
 
-// Draws `image` into `rect` under the software renderer once per band of the clip's device rows, each clipped
-// without antialiasing to its band and stepping few enough rows, so every destination pixel is painted by one draw
-// of the whole image with the context's alpha, blend mode and style.
-static void wk_drawInDeviceRowBands(CGContextRef context, CGRect rect, CGImageRef image)
+// The bounding box of the clip in device space.
+static CGRect wk_deviceClipBoundingBox(CGContextRef context)
 {
-    CGAffineTransform ctm = CGContextGetCTM(context);
-    double extent = wk_steppedExtent(ctm, CGImageGetWidth(image), CGImageGetHeight(image));
-    double bandRows = fmax(floor(16777216.0 / extent) - 2, 1);
-    CGRect deviceClip = CGRectIntegral(CGRectApplyAffineTransform(CGContextGetClipBoundingBox(context), ctm));
-    bool antialias = CGContextGetShouldAntialias(context);
-    for (double bandBottom = CGRectGetMinY(deviceClip); bandBottom < CGRectGetMaxY(deviceClip); bandBottom += bandRows) {
-        CGContextSaveGState(context);
-        CGContextSetCTM(context, CGAffineTransformIdentity);
-        CGContextSetShouldAntialias(context, false);
-        CGContextClipToRect(context, CGRectMake(CGRectGetMinX(deviceClip), bandBottom, deviceClip.size.width,
-            fmin(bandRows, CGRectGetMaxY(deviceClip) - bandBottom)));
-        CGContextSetShouldAntialias(context, antialias);
-        CGContextSetCTM(context, ctm);
-        WK_ORIGINAL(CGContextDrawImage)(context, rect, image);
+    CGContextSaveGState(context);
+    CGContextSetCTM(context, CGAffineTransformIdentity);
+    CGRect box = CGContextGetClipBoundingBox(context);
+    CGContextRestoreGState(context);
+    return box;
+}
+
+// Bands of `deviceClip`'s rows few enough that a draw of a texture `extent` pixels along its stepped coordinates lands
+// in place. wk_nextDeviceRowBand clips the context without antialiasing to the next band, with the current path and
+// text position the draw started with and a clipping text mode's painting mode, and answers false after the last.
+static void wk_beginDeviceRowBands(CGContextRef context, double extent, CGRect deviceClip, wk_device_row_bands *bands)
+{
+    bands->context = context;
+    bands->ctm = CGContextGetCTM(context);
+    bands->deviceClip = CGRectIntegral(deviceClip);
+    bands->bandRows = fmax(floor(16777216.0 / extent) - 2, 1);
+    bands->bandBottom = CGRectGetMinY(bands->deviceClip);
+    bands->antialias = CGContextGetShouldAntialias(context);
+    bands->open = false;
+    bands->path = CGContextIsPathEmpty(context) ? NULL : CGContextCopyPath(context);
+    bands->textPosition = CGContextGetTextPosition(context);
+    bands->textMode = CGContextGetTextDrawingMode(context);
+}
+
+bool wk_nextDeviceRowBand(wk_device_row_bands *bands)
+{
+    CGContextRef context = bands->context;
+    if (bands->open)
         CGContextRestoreGState(context);
+    bands->open = bands->bandBottom < CGRectGetMaxY(bands->deviceClip);
+    if (!bands->open) {
+        if (bands->path)
+            CGPathRelease(bands->path);
+        return false;
     }
+    CGContextSaveGState(context);
+    CGContextSetCTM(context, CGAffineTransformIdentity);
+    CGContextSetShouldAntialias(context, false);
+    CGContextClipToRect(context, CGRectMake(CGRectGetMinX(bands->deviceClip), bands->bandBottom, bands->deviceClip.size.width,
+        fmin(bands->bandRows, CGRectGetMaxY(bands->deviceClip) - bands->bandBottom)));
+    CGContextSetShouldAntialias(context, bands->antialias);
+    CGContextSetCTM(context, bands->ctm);
+    CGContextBeginPath(context);
+    if (bands->path)
+        CGContextAddPath(context, bands->path);
+    CGContextSetTextPosition(context, bands->textPosition.x, bands->textPosition.y);
+    if (bands->textMode >= kCGTextFillClip && bands->textMode <= kCGTextFillStrokeClip)
+        CGContextSetTextDrawingMode(context, bands->textMode - kCGTextFillClip);
+    bands->bandBottom += bands->bandRows;
+    return true;
+}
+
+// Draws `image` into `rect` with `draw` under the software renderer once per band of the clip's device rows, so every
+// destination pixel is painted by one draw of the whole image with the context's alpha, blend mode and style.
+static void wk_drawInDeviceRowBands(CGContextRef context, CGRect rect, CGImageRef image, void (*draw)(CGContextRef, CGRect, CGImageRef))
+{
+    wk_device_row_bands bands;
+    wk_beginDeviceRowBands(context, wk_steppedExtent(CGContextGetCTM(context), CGImageGetWidth(image), CGImageGetHeight(image)),
+        wk_deviceClipBoundingBox(context), &bands);
+    while (wk_nextDeviceRowBand(&bands))
+        draw(context, rect, image);
+}
+
+// Image pixels `left`, `top` to `right`, `bottom` of `image`, drawn by CoreGraphics with the context's interpolation
+// quality into an image of the context's colour space within the texture limit and about two of its pixels to a
+// device pixel of the draw `toImage` maps device space from.
+static CGImageRef wk_createReducedImagePart(CGContextRef context, CGImageRef image, CGAffineTransform toImage, double left, double top, double right, double bottom)
+{
+    double limit = wk_imageTextureLimit() - 2;
+    double partWidth = right - left, partHeight = bottom - top;
+    double reducedWidth = fmin(ceil(partWidth / fmax(floor(hypot(toImage.a, toImage.c) / 2), 1)), limit);
+    double reducedHeight = fmin(ceil(partHeight / fmax(floor(hypot(toImage.b, toImage.d) / 2), 1)), limit);
+    CGColorSpaceRef colorSpace = CGContextGetColorSpace(context);
+    if (!colorSpace || CGColorSpaceGetModel(colorSpace) != kCGColorSpaceModelRGB)
+        colorSpace = CGImageGetColorSpace(image);
+    CGColorSpaceRef sRGB = NULL;
+    if (!colorSpace || CGColorSpaceGetModel(colorSpace) != kCGColorSpaceModelRGB)
+        colorSpace = sRGB = WK_SYSTEM(CGColorSpaceCreateWithName)(kCGColorSpaceSRGB);
+    CGContextRef bitmap = colorSpace ? CGBitmapContextCreate(NULL, (size_t)reducedWidth, (size_t)reducedHeight, 8, (size_t)reducedWidth * 4, colorSpace, wk_bgraInfo) : NULL;
+    if (sRGB)
+        CGColorSpaceRelease(sRGB);
+    if (!bitmap)
+        return NULL;
+    double scaleX = reducedWidth / partWidth, scaleY = reducedHeight / partHeight;
+    CGContextSetInterpolationQuality(bitmap, CGContextGetInterpolationQuality(context));
+    WK_ORIGINAL(CGContextDrawImage)(bitmap, CGRectMake(-left * scaleX, (bottom - CGImageGetHeight(image)) * scaleY,
+        CGImageGetWidth(image) * scaleX, CGImageGetHeight(image) * scaleY), image);
+    CGImageRef reduced = CGBitmapContextCreateImage(bitmap);
+    CGContextRelease(bitmap);
+    if (reduced && !CGImageGetShouldInterpolate(image)) {
+        CGImageRef exact = CGImageCreate(CGImageGetWidth(reduced), CGImageGetHeight(reduced), 8, 32, CGImageGetBytesPerRow(reduced),
+            CGImageGetColorSpace(reduced), wk_bgraInfo, CGImageGetDataProvider(reduced), NULL, false, CGImageGetRenderingIntent(image));
+        CGImageRelease(reduced);
+        reduced = exact;
+    }
+    return reduced;
 }
 
 // Answers whether the draw was made here; false leaves it to 10.9, which draws an image within the limit, stepping
@@ -2929,7 +3005,7 @@ static bool wk_drawOversizedImageInIOSurface(CGContextRef context, CGRect rect, 
     if (width <= limit && height <= limit) {
         if (!software || wk_softwareRendererPlacesExactly(wk_steppedDeviceRows(context, rect), wk_steppedExtent(ctm, width, height)))
             return false;
-        wk_drawInDeviceRowBands(context, rect, image);
+        wk_drawInDeviceRowBands(context, rect, image, WK_ORIGINAL(CGContextDrawImage));
         return true;
     }
     if (!software) {
@@ -2942,11 +3018,14 @@ static bool wk_drawOversizedImageInIOSurface(CGContextRef context, CGRect rect, 
     if (CGRectIsEmpty(wk_visiblePartOfDraw(context, rect)))
         return true;
 
-    // Without rotation or skew: tiles of whole device pixels over the clip, each clipped without antialiasing, so
-    // every destination pixel is painted by one tile with the context's alpha, blend mode and style. A tile draws the
-    // image pixels it maps to, with those its filter reads and those whose style paints into it, as an image over the
-    // image's bytes, or else a part made by CGImageCreateWithImageInRect, which the software renderer draws from the
-    // part's own texture when the image is over its limit.
+    // Tiles of whole device pixels over the clip, each clipped without antialiasing, so every destination pixel is
+    // painted by one tile with the context's alpha, blend mode and style. A tile draws the image pixels it maps to, with
+    // those its filter reads and those whose style paints into it, as an image over the image's bytes, or else a part
+    // with a texture of its own: under the software renderer one made by CGImageCreateWithImageInRect, which it draws
+    // from the part's own texture when the image is over its limit, under the accelerated renderer a copy. A draw
+    // shrinking more than twice under the accelerated renderer, which clips a large texture's shrunk rows short, or
+    // turned under either, whose edges then fall by the part's size, or whose pixels or style reach past the limit,
+    // draws its pixels within the clip reduced by CoreGraphics instead.
     double pixelsPerUnitX = width / rect.size.width, pixelsPerUnitY = height / rect.size.height;
     double reach = wk_styleReachInImagePixels(context, rect, image);
     double margin = wk_filterMarginForDraw(context, rect, image) + reach;
@@ -2954,55 +3033,48 @@ static bool wk_drawOversizedImageInIOSurface(CGContextRef context, CGRect rect, 
         CGAffineTransformMake(pixelsPerUnitX, 0, 0, -pixelsPerUnitY, -CGRectGetMinX(rect) * pixelsPerUnitX, CGRectGetMaxY(rect) * pixelsPerUnitY));
     double imagePixelsPerDevicePixel = fmax(fabs(toImage.a) + fabs(toImage.c), fabs(toImage.b) + fabs(toImage.d));
     double tile = floor((limit - 2 * margin - 2) / imagePixelsPerDevicePixel);
-    if (software && ctm.b == 0 && ctm.c == 0 && tile >= 1 && reach <= floor(limit / 4.0)) {
-        CGRect deviceClip = CGRectIntegral(CGRectApplyAffineTransform(CGContextGetClipBoundingBox(context), ctm));
-        bool antialias = CGContextGetShouldAntialias(context);
-        for (double tileY = CGRectGetMinY(deviceClip); tileY < CGRectGetMaxY(deviceClip); tileY += tile) {
-            for (double tileX = CGRectGetMinX(deviceClip); tileX < CGRectGetMaxX(deviceClip); tileX += tile) {
-                CGRect deviceTile = CGRectMake(tileX, tileY, fmin(tile, CGRectGetMaxX(deviceClip) - tileX), fmin(tile, CGRectGetMaxY(deviceClip) - tileY));
-                CGRect pixels = CGRectApplyAffineTransform(deviceTile, toImage);
-                double partLeft = fmax(floor(CGRectGetMinX(pixels) - margin), 0), partTop = fmax(floor(CGRectGetMinY(pixels) - margin), 0);
-                double partRight = fmin(ceil(CGRectGetMaxX(pixels) + margin), width), partBottom = fmin(ceil(CGRectGetMaxY(pixels) + margin), height);
-                if (partRight <= partLeft || partBottom <= partTop)
-                    continue;
-                CGImageRef part = wk_createImagePartOverBytes(image, partLeft, partTop, partRight, partBottom);
-                if (!part)
+    CGRect deviceClip = CGRectIntegral(wk_deviceClipBoundingBox(context));
+    CGColorSpaceRef colorSpace = CGContextGetColorSpace(context);
+    bool antialias = CGContextGetShouldAntialias(context);
+    bool reduces = tile < 1 || reach > floor(limit / 4.0) || (imagePixelsPerDevicePixel > 2 && (!software || ctm.b != 0 || ctm.c != 0));
+    if (reduces)
+        tile = fmax(deviceClip.size.width, deviceClip.size.height);
+    for (double tileY = CGRectGetMinY(deviceClip); tileY < CGRectGetMaxY(deviceClip); tileY += tile) {
+        for (double tileX = CGRectGetMinX(deviceClip); tileX < CGRectGetMaxX(deviceClip); tileX += tile) {
+            CGRect deviceTile = CGRectMake(tileX, tileY, fmin(tile, CGRectGetMaxX(deviceClip) - tileX), fmin(tile, CGRectGetMaxY(deviceClip) - tileY));
+            CGRect pixels = CGRectApplyAffineTransform(deviceTile, toImage);
+            double partLeft = fmax(floor(CGRectGetMinX(pixels) - margin), 0), partTop = fmax(floor(CGRectGetMinY(pixels) - margin), 0);
+            double partRight = fmin(ceil(CGRectGetMaxX(pixels) + margin), width), partBottom = fmin(ceil(CGRectGetMaxY(pixels) + margin), height);
+            if (partRight <= partLeft || partBottom <= partTop)
+                continue;
+            CGImageRef part = NULL;
+            if (reduces)
+                part = wk_createReducedImagePart(context, image, toImage, partLeft, partTop, partRight, partBottom);
+            else if (!(part = wk_createImagePartOverBytes(image, partLeft, partTop, partRight, partBottom))) {
+                if (software)
                     part = CGImageCreateWithImageInRect(image, CGRectMake(partLeft, partTop, partRight - partLeft, partBottom - partTop));
-                if (!part)
-                    continue;
-                CGRect partRect = CGRectMake(CGRectGetMinX(rect) + partLeft / pixelsPerUnitX, CGRectGetMaxY(rect) - partBottom / pixelsPerUnitY,
-                    (partRight - partLeft) / pixelsPerUnitX, (partBottom - partTop) / pixelsPerUnitY);
-                CGContextSaveGState(context);
-                CGContextSetCTM(context, CGAffineTransformIdentity);
-                CGContextSetShouldAntialias(context, false);
-                CGContextClipToRect(context, deviceTile);
-                CGContextSetShouldAntialias(context, antialias);
-                CGContextSetCTM(context, ctm);
-                if (software && !wk_softwareRendererPlacesExactly(wk_steppedDeviceRows(context, partRect),
-                    wk_steppedExtent(ctm, CGImageGetWidth(part), CGImageGetHeight(part))))
-                    wk_drawInDeviceRowBands(context, partRect, part);
-                else
-                    WK_ORIGINAL(CGContextDrawImage)(context, partRect, part);
-                CGContextRestoreGState(context);
-                CGImageRelease(part);
+                else if (colorSpace)
+                    part = wk_copyImagePart(image, colorSpace, partLeft, partTop, partRight, partBottom);
             }
+            if (!part)
+                continue;
+            CGRect partRect = CGRectMake(CGRectGetMinX(rect) + partLeft / pixelsPerUnitX, CGRectGetMaxY(rect) - partBottom / pixelsPerUnitY,
+                (partRight - partLeft) / pixelsPerUnitX, (partBottom - partTop) / pixelsPerUnitY);
+            CGContextSaveGState(context);
+            CGContextSetCTM(context, CGAffineTransformIdentity);
+            CGContextSetShouldAntialias(context, false);
+            CGContextClipToRect(context, deviceTile);
+            CGContextSetShouldAntialias(context, antialias);
+            CGContextSetCTM(context, ctm);
+            if (software && !wk_softwareRendererPlacesExactly(wk_steppedDeviceRows(context, partRect),
+                wk_steppedExtent(ctm, CGImageGetWidth(part), CGImageGetHeight(part))))
+                wk_drawInDeviceRowBands(context, partRect, part, WK_ORIGINAL(CGContextDrawImage));
+            else
+                WK_ORIGINAL(CGContextDrawImage)(context, partRect, part);
+            CGContextRestoreGState(context);
+            CGImageRelease(part);
         }
-        return true;
     }
-
-    // Otherwise CoreGraphics draws the image, with the context's state, into a bitmap of the device pixels the draw
-    // and its style reach within the clip; the bitmap, within the limit, then replaces those pixels.
-    CGRect deviceReach = CGRectApplyAffineTransform(rect, ctm);
-    CGStyleRef style = CGContextGetStyle(context);
-    if (style) {
-        CGRect styled = CGStyleGetDrawBoundingBox(style, deviceReach);
-        deviceReach = CGRectIsNull(styled) || CGRectIsInfinite(styled) ? CGRectInfinite : CGRectUnion(deviceReach, styled);
-    }
-    wk_blend_read_back readBack;
-    if (!wk_beginStyledDraw(context, CGContextGetBlendMode(context), !wk_insideOffscreenSurfaceLayer(context), &readBack, deviceReach))
-        return false;
-    WK_ORIGINAL(CGContextDrawImage)(readBack.target, rect, image);
-    wk_endStyledDraw(&readBack);
     return true;
 }
 
@@ -3566,6 +3638,21 @@ WK_POLYFILL_REPLACES("CoreGraphics", void, CGContextDrawTiledImage, (CGContextRe
         if (wk_drawsThroughCoreAnimationIOSurface(context))
             drawn = wk_copyImageForIOSurfacePattern(context, image);
     }
+    // Under the software renderer, a tile stepping more rows than land in place -- its device rows within the clip's --
+    // is drawn with the whole tiling once per band of the clip's device rows.
+    if (context && image && rect.size.width > 0 && rect.size.height > 0 && wk_coreAnimationTextureLimit()
+        && wk_drawsThroughCoreAnimationIOSurface(context)) {
+        CGAffineTransform ctm = CGContextGetCTM(context);
+        CGRect deviceClip = wk_deviceClipBoundingBox(context);
+        if (!CGRectIsNull(deviceClip) && !CGRectIsInfinite(deviceClip)
+            && !wk_softwareRendererPlacesExactly(ceil(fmin(CGRectApplyAffineTransform(rect, ctm).size.height, deviceClip.size.height)) + 1,
+                wk_steppedExtent(ctm, CGImageGetWidth(image), CGImageGetHeight(image)))) {
+            wk_drawInDeviceRowBands(context, rect, drawn ? drawn : image, WK_ORIGINAL(CGContextDrawTiledImage));
+            if (drawn)
+                CGImageRelease(drawn);
+            return;
+        }
+    }
     WK_ORIGINAL(CGContextDrawTiledImage)(context, rect, drawn ? drawn : image);
     if (drawn)
         CGImageRelease(drawn);
@@ -3573,6 +3660,9 @@ WK_POLYFILL_REPLACES("CoreGraphics", void, CGContextDrawTiledImage, (CGContextRe
 
 extern CGPatternRef CGPatternCreateWithImage2(CGImageRef, CGAffineTransform, CGPatternTiling);
 extern CGImageRef CGPatternGetImage(CGPatternRef);
+extern CGRect CGPatternGetBounds(CGPatternRef);
+extern CGColorRef CGContextGetFillColorAsColor(CGContextRef);
+extern CGColorRef CGContextGetStrokeColorAsColor(CGContextRef);
 extern CGAffineTransform CGPatternGetMatrix(CGPatternRef);
 extern CGPatternTiling CGPatternGetTiling(CGPatternRef);
 
@@ -4056,9 +4146,9 @@ static bool wk_beginReadBack(CGContextRef context, CGBlendMode mode, wk_blend_re
     return true;
 }
 
-// `blends` composites over the destination in the bitmap; otherwise the bitmap holds the draw alone, which reaches the
-// context under the context's own blend mode.
-static bool wk_beginStyledDraw(CGContextRef context, CGBlendMode mode, bool blends, wk_blend_read_back *readBack, CGRect deviceBounds)
+// `blends` composites over the destination in the bitmap, which replaces it; otherwise the bitmap holds the draw alone
+// and composites over the context, as CoreGraphics composites a focus ring under every blend mode.
+static bool wk_beginStyledDraw(CGContextRef context, CGBlendMode mode, bool blends, wk_blend_read_back *readBack)
 {
     wk_surface_drawable drawable;
     if (!wk_contextDrawable(context, &drawable))
@@ -4066,8 +4156,6 @@ static bool wk_beginStyledDraw(CGContextRef context, CGBlendMode mode, bool blen
     CGAffineTransform ctm = CGContextGetCTM(context);
     CGRect region = CGRectIntersection(CGRectIntegral(CGRectApplyAffineTransform(CGContextGetClipBoundingBox(context), ctm)),
         CGRectMake(0, 0, drawable.width, drawable.height));
-    if (!CGRectIsInfinite(deviceBounds))
-        region = CGRectIntersection(region, CGRectIntegral(deviceBounds));
     if (CGRectIsNull(region) || CGRectIsEmpty(region) || !(ctm.a * ctm.d - ctm.b * ctm.c))
         return false;
     CGColorSpaceRef space = CGContextGetColorSpace(context);
@@ -4133,8 +4221,7 @@ static void wk_endStyledDraw(wk_blend_read_back *readBack)
     CGContextSetStyle(context, NULL);
     CGContextSetInterpolationQuality(context, kCGInterpolationNone);
     CGContextSetAlpha(context, 1);
-    if (readBack->blends)
-        CGContextSetBlendMode(context, kCGBlendModeCopy);
+    CGContextSetBlendMode(context, readBack->blends ? kCGBlendModeCopy : kCGBlendModeNormal);
     CGContextDrawImage(context, readBack->region, image);
     CGContextRestoreGState(context);
     CGImageRelease(image);
@@ -4155,8 +4242,93 @@ bool wk_blendReadBackBegin(CGContextRef context, wk_blend_read_back *readBack)
     if (!blends && !dropsStyle)
         return false;
     if (style)
-        return wk_beginStyledDraw(context, mode, blends, readBack, CGRectInfinite);
+        return wk_beginStyledDraw(context, mode, blends, readBack);
     return wk_beginReadBack(context, mode, readBack);
+}
+
+// The texture extent of `color`'s pattern cell along its stepped coordinates -- of its image, or for a drawn cell of its
+// own device pixels -- when the software renderer draws the cell out of place under a clip `clipRows` device rows
+// tall, otherwise 0. A cell steps its device rows within the clip's; pattern space maps to the context's base space.
+static double wk_outOfPlacePatternExtent(CGContextRef context, CGColorRef color, double clipRows)
+{
+    CGPatternRef pattern = color ? CGColorGetPattern(color) : NULL;
+    if (!pattern)
+        return 0;
+    CGAffineTransform cell = CGAffineTransformConcat(CGPatternGetMatrix(pattern), CGContextGetBaseCTM(context));
+    CGRect bounds = CGPatternGetBounds(pattern), device = CGRectApplyAffineTransform(bounds, cell);
+    CGImageRef image = CGPatternGetImage(pattern);
+    double wide = image ? CGImageGetWidth(image) : ceil(device.size.width), high = image ? CGImageGetHeight(image) : ceil(device.size.height);
+    double extent = wk_steppedExtent(cell, wide, high);
+    return wk_softwareRendererPlacesExactly(ceil(fmin(device.size.height, clipRows)) + 1, extent) ? 0 : extent;
+}
+
+int wk_textModePaints(CGTextDrawingMode mode)
+{
+    switch (mode) {
+    case kCGTextFill:
+    case kCGTextFillClip:
+        return WK_PAINTS_FILL;
+    case kCGTextStroke:
+    case kCGTextStrokeClip:
+        return WK_PAINTS_STROKE;
+    case kCGTextFillStroke:
+    case kCGTextFillStrokeClip:
+        return WK_PAINTS_FILL | WK_PAINTS_STROKE;
+    default:
+        return 0;
+    }
+}
+
+static int wk_pathModePaints(CGPathDrawingMode mode)
+{
+    switch (mode) {
+    case kCGPathFill:
+    case kCGPathEOFill:
+        return WK_PAINTS_FILL;
+    case kCGPathStroke:
+        return WK_PAINTS_STROKE;
+    default:
+        return WK_PAINTS_FILL | WK_PAINTS_STROKE;
+    }
+}
+
+// Under the software renderer, a primitive painted with the fill colour, the stroke colour or both (`paints`) in a
+// pattern whose cell it draws out of place is drawn once per band of the clip's device rows: answers whether the
+// caller draws it once per wk_nextDeviceRowBand. A cell that one-row bands would still draw out of place is left to
+// 10.9.
+bool wk_beginPaintBands(CGContextRef context, int paints, wk_device_row_bands *bands)
+{
+    if (!context || !paints || !wk_coreAnimationTextureLimit() || !wk_drawsThroughCoreAnimationIOSurface(context))
+        return false;
+    CGColorRef fill = (paints & WK_PAINTS_FILL) ? CGContextGetFillColorAsColor(context) : NULL;
+    CGColorRef stroke = (paints & WK_PAINTS_STROKE) ? CGContextGetStrokeColorAsColor(context) : NULL;
+    if (!(fill && CGColorGetPattern(fill)) && !(stroke && CGColorGetPattern(stroke)))
+        return false;
+    CGRect deviceClip = wk_deviceClipBoundingBox(context);
+    if (CGRectIsNull(deviceClip) || CGRectIsInfinite(deviceClip) || CGRectIsEmpty(deviceClip))
+        return false;
+    double extent = fmax(wk_outOfPlacePatternExtent(context, fill, deviceClip.size.height),
+        wk_outOfPlacePatternExtent(context, stroke, deviceClip.size.height));
+    if (!extent || !wk_softwareRendererPlacesExactly(2, extent))
+        return false;
+    wk_beginDeviceRowBands(context, extent, deviceClip, bands);
+    return true;
+}
+
+// After the bands of a text draw in a clipping text mode: sets the clip mode and the starting text position for the
+// caller to draw the text once more, and answers whether it does.
+bool wk_beginTextClipAfterBands(wk_device_row_bands *bands)
+{
+    if (bands->textMode < kCGTextFillClip || bands->textMode > kCGTextFillStrokeClip)
+        return false;
+    CGContextSetTextDrawingMode(bands->context, kCGTextClip);
+    CGContextSetTextPosition(bands->context, bands->textPosition.x, bands->textPosition.y);
+    return true;
+}
+
+void wk_endTextClipAfterBands(wk_device_row_bands *bands)
+{
+    CGContextSetTextDrawingMode(bands->context, bands->textMode);
 }
 
 static void wk_endReadBack(wk_blend_read_back *readBack, CGFloat alpha)
@@ -4243,8 +4415,24 @@ void wk_blendReadBackTextClipEnd(wk_blend_read_back *readBack)
     CFRelease(readBack->style);
 }
 
+// A draw is made once per band of rows by the hook's in-band half, which reads back what its blend mode or style needs.
 #define WK_READ_BACK_TEXT_DRAW(NAME, PARAMS, ARGUMENTS) \
+    static void wk_inBand_##NAME PARAMS; \
     WK_POLYFILL_REPLACES("CoreGraphics", void, NAME, PARAMS) \
+    { \
+        wk_device_row_bands bands; \
+        if (wk_beginPaintBands(context, wk_textModePaints(CGContextGetTextDrawingMode(context)), &bands)) { \
+            while (wk_nextDeviceRowBand(&bands)) \
+                wk_inBand_##NAME ARGUMENTS; \
+            if (wk_beginTextClipAfterBands(&bands)) { \
+                WK_ORIGINAL(NAME) ARGUMENTS; \
+                wk_endTextClipAfterBands(&bands); \
+            } \
+            return; \
+        } \
+        wk_inBand_##NAME ARGUMENTS; \
+    } \
+    static void wk_inBand_##NAME PARAMS \
     { \
         wk_blend_read_back readBack; \
         CGContextRef original = context; \
@@ -4262,8 +4450,19 @@ void wk_blendReadBackTextClipEnd(wk_blend_read_back *readBack)
         } \
     }
 
-#define WK_READ_BACK_DRAW(NAME, PARAMS, ARGUMENTS) \
+#define WK_READ_BACK_DRAW(NAME, PARAMS, ARGUMENTS, PAINTS) \
+    static void wk_inBand_##NAME PARAMS; \
     WK_POLYFILL_REPLACES("CoreGraphics", void, NAME, PARAMS) \
+    { \
+        wk_device_row_bands bands; \
+        if (wk_beginPaintBands(context, PAINTS, &bands)) { \
+            while (wk_nextDeviceRowBand(&bands)) \
+                wk_inBand_##NAME ARGUMENTS; \
+            return; \
+        } \
+        wk_inBand_##NAME ARGUMENTS; \
+    } \
+    static void wk_inBand_##NAME PARAMS \
     { \
         wk_blend_read_back readBack; \
         bool active = wk_blendReadBackBegin(context, &readBack); \
@@ -4274,20 +4473,20 @@ void wk_blendReadBackTextClipEnd(wk_blend_read_back *readBack)
             wk_blendReadBackEnd(&readBack); \
     }
 
-WK_READ_BACK_DRAW(CGContextFillRect, (CGContextRef context, CGRect rect), (context, rect))
-WK_READ_BACK_DRAW(CGContextFillRects, (CGContextRef context, const CGRect *rects, size_t count), (context, rects, count))
-WK_READ_BACK_DRAW(CGContextFillPath, (CGContextRef context), (context))
-WK_READ_BACK_DRAW(CGContextEOFillPath, (CGContextRef context), (context))
-WK_READ_BACK_DRAW(CGContextStrokePath, (CGContextRef context), (context))
-WK_READ_BACK_DRAW(CGContextDrawPath, (CGContextRef context, CGPathDrawingMode mode), (context, mode))
-WK_READ_BACK_DRAW(CGContextStrokeRect, (CGContextRef context, CGRect rect), (context, rect))
-WK_READ_BACK_DRAW(CGContextStrokeRectWithWidth, (CGContextRef context, CGRect rect, CGFloat width), (context, rect, width))
-WK_READ_BACK_DRAW(CGContextFillEllipseInRect, (CGContextRef context, CGRect rect), (context, rect))
-WK_READ_BACK_DRAW(CGContextStrokeEllipseInRect, (CGContextRef context, CGRect rect), (context, rect))
-WK_READ_BACK_DRAW(CGContextDrawShading, (CGContextRef context, CGShadingRef shading), (context, shading))
-WK_READ_BACK_DRAW(CGContextDrawLayerInRect, (CGContextRef context, CGRect rect, CGLayerRef layer), (context, rect, layer))
-WK_READ_BACK_DRAW(CGContextDrawPDFPage, (CGContextRef context, CGPDFPageRef page), (context, page))
-WK_READ_BACK_DRAW(CGContextDrawLayerAtPoint, (CGContextRef context, CGPoint point, CGLayerRef layer), (context, point, layer))
+WK_READ_BACK_DRAW(CGContextFillRect, (CGContextRef context, CGRect rect), (context, rect), WK_PAINTS_FILL)
+WK_READ_BACK_DRAW(CGContextFillRects, (CGContextRef context, const CGRect *rects, size_t count), (context, rects, count), WK_PAINTS_FILL)
+WK_READ_BACK_DRAW(CGContextFillPath, (CGContextRef context), (context), WK_PAINTS_FILL)
+WK_READ_BACK_DRAW(CGContextEOFillPath, (CGContextRef context), (context), WK_PAINTS_FILL)
+WK_READ_BACK_DRAW(CGContextStrokePath, (CGContextRef context), (context), WK_PAINTS_STROKE)
+WK_READ_BACK_DRAW(CGContextDrawPath, (CGContextRef context, CGPathDrawingMode mode), (context, mode), wk_pathModePaints(mode))
+WK_READ_BACK_DRAW(CGContextStrokeRect, (CGContextRef context, CGRect rect), (context, rect), WK_PAINTS_STROKE)
+WK_READ_BACK_DRAW(CGContextStrokeRectWithWidth, (CGContextRef context, CGRect rect, CGFloat width), (context, rect, width), WK_PAINTS_STROKE)
+WK_READ_BACK_DRAW(CGContextFillEllipseInRect, (CGContextRef context, CGRect rect), (context, rect), WK_PAINTS_FILL)
+WK_READ_BACK_DRAW(CGContextStrokeEllipseInRect, (CGContextRef context, CGRect rect), (context, rect), WK_PAINTS_STROKE)
+WK_READ_BACK_DRAW(CGContextDrawShading, (CGContextRef context, CGShadingRef shading), (context, shading), 0)
+WK_READ_BACK_DRAW(CGContextDrawLayerInRect, (CGContextRef context, CGRect rect, CGLayerRef layer), (context, rect, layer), 0)
+WK_READ_BACK_DRAW(CGContextDrawPDFPage, (CGContextRef context, CGPDFPageRef page), (context, page), 0)
+WK_READ_BACK_DRAW(CGContextDrawLayerAtPoint, (CGContextRef context, CGPoint point, CGLayerRef layer), (context, point, layer), 0)
 WK_READ_BACK_TEXT_DRAW(CGContextShowGlyphsAtPositions, (CGContextRef context, const CGGlyph *glyphs, const CGPoint *positions, size_t count), (context, glyphs, positions, count))
 WK_READ_BACK_TEXT_DRAW(CGContextShowGlyphs, (CGContextRef context, const CGGlyph *glyphs, size_t count), (context, glyphs, count))
 WK_READ_BACK_TEXT_DRAW(CGContextShowGlyphsAtPoint, (CGContextRef context, CGFloat x, CGFloat y, const CGGlyph *glyphs, size_t count), (context, x, y, glyphs, count))

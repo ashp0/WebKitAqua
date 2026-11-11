@@ -14,7 +14,8 @@
 // several heights and also turned a quarter, paint every pixel exactly once. Turned 10, 30 and 45 degrees, shrunk to
 // a few pixels, shrunk evenly from 17000 square, shrunk under a shadow 150 pixels away, or with a top or right edge
 // in view enlarged, one to one at a half-pixel origin, or turned 5 degrees, tall and oversized images land within 40
-// levels of alpha of CoreGraphics' own bitmap draw of them. 10.9's own draw of 512- and 1024-row windows of a
+// levels of alpha of CoreGraphics' own bitmap draw of them, three of them also drawn under the copy blend mode into a
+// transparency layer, off their antialiased edges. 10.9's own draw of 512- and 1024-row windows of a
 // 16000-row image lands in place unaided. The probe runs under the renderer the machine has and again under the
 // software renderer, which built with WK_PROBE_SOFTWARE_RENDERER it forces by failing CGLChoosePixelFormat, as
 // CA::CG::IOSurfaceRenderer::acquire meets it on a Mac without an accelerated renderer.
@@ -453,17 +454,22 @@ int main(void)
             // Placed: the surface is placedWidth x surfaceSide, and the rect's origin, before the turn, at placeX, placeY.
             int placedWidth;
             double placeX, placeY;
+            // Drawn under the copy blend mode into a transparency layer filled magenta, compared off the image's
+            // antialiased edge, whose pixels 10.9's renderers composite under copy unlike CoreGraphics' bitmap.
+            bool layerCopy;
         } turns[] = {
-            { 64, 16000, 64, 2000, 1500, 30, 128, 0, 0, 0, 0, 0 }, { 64, 16000, 64, 2000, 1500, 45, 128, 0, 0, 0, 0, 0 }, { 8, 40000, 8, 60, 64, 45, 128, 0, 0, 0, 0, 0 },
-            { 40000, 8, 8, 8, 16, 0, 255, 0, 0, 0, 0, 0 }, { 40000, 8, 3, 8, 16, 0, 255, 0, 0, 0, 0, 0 }, { 20000, 2000, 400, 40, 600, 10, 255, 0, 0, 0, 0, 0 }, { 20000, 2000, 400, 40, 600, 10, 128, 0, 0, 0, 0, 0 },
-            { 17000, 17000, 400, 400, 500, 0, 255, 0, 0, 0, 0, 0 }, { 8, 20000, 8, 1000, 1100, 0, 255, 0, 0, 0, 0, 0 }, { 20000, 2000, 400, 40, 700, 0, 255, 0, -150, 0, 0, 0 },
-            { 20000, 2000, 400, 40, 700, 0, 255, 150, 0, 0, 0, 0 },
+            { 64, 16000, 64, 2000, 1500, 30, 128, 0, 0, 0, 0, 0, false }, { 64, 16000, 64, 2000, 1500, 45, 128, 0, 0, 0, 0, 0, false }, { 8, 40000, 8, 60, 64, 45, 128, 0, 0, 0, 0, 0, false },
+            { 40000, 8, 8, 8, 16, 0, 255, 0, 0, 0, 0, 0, false }, { 40000, 8, 3, 8, 16, 0, 255, 0, 0, 0, 0, 0, false }, { 20000, 2000, 400, 40, 600, 10, 255, 0, 0, 0, 0, 0, false }, { 20000, 2000, 400, 40, 600, 10, 128, 0, 0, 0, 0, 0, false },
+            { 17000, 17000, 400, 400, 500, 0, 255, 0, 0, 0, 0, 0, false }, { 8, 20000, 8, 1000, 1100, 0, 255, 0, 0, 0, 0, 0, false }, { 20000, 2000, 400, 40, 700, 0, 255, 0, -150, 0, 0, 0, false },
+            { 20000, 2000, 400, 40, 700, 0, 255, 150, 0, 0, 0, 0, false },
             // An image's top edge enlarged twice with its columns 2000 to 3000 in view, and one to one at a half-pixel
             // origin with its columns 2000 to 4000 in view; its right edge with its rows 2000 to 4000 in view at a
             // half-pixel origin; and its top-right corner 10 pixels in from the surface's, turned 5 degrees, with
             // columns 18000 on in view.
-            { 20000, 20, 40000, 40, 200, 0, 255, 0, 0, 2000, -4000, 150 }, { 20000, 9, 20000, 9, 200, 0, 255, 0, 0, 2000, -2000, 181.5 },
-            { 9, 20001, 9, 20001, 2000, 0, 255, 0, 0, 200, 181.5, -16001 }, { 20000, 20, 20000, 40, 2000, 5, 255, 0, 0, 2000, -1, -1 },
+            { 20000, 20, 40000, 40, 200, 0, 255, 0, 0, 2000, -4000, 150, false }, { 20000, 9, 20000, 9, 200, 0, 255, 0, 0, 2000, -2000, 181.5, false },
+            { 9, 20001, 9, 20001, 2000, 0, 255, 0, 0, 200, 181.5, -16001, false }, { 20000, 20, 20000, 40, 2000, 5, 255, 0, 0, 2000, -1, -1, false },
+            { 20000, 2000, 400, 40, 600, 10, 255, 0, 0, 0, 0, 0, true }, { 40000, 8, 8, 8, 16, 0, 255, 0, 0, 0, 0, 0, true },
+            { 20000, 20, 40000, 40, 200, 0, 255, 0, 0, 2000, -4000, 150, true },
         };
         for (size_t t = 0; t < sizeof turns / sizeof turns[0]; t++) {
             int iw = turns[t].imageWidth, ih = turns[t].imageHeight, side = turns[t].surfaceSide;
@@ -485,6 +491,13 @@ int main(void)
             CGContextClearRect(context, CGRectMake(0, 0, sideWide, side));
             CGContextRef both[2] = { context, reference };
             for (int k = 0; k < 2; k++) {
+                CGContextSaveGState(both[k]);
+                if (turns[t].layerCopy) {
+                    CGContextBeginTransparencyLayer(both[k], NULL);
+                    CGContextSetRGBFillColor(both[k], 1, 0, 1, 1);
+                    CGContextFillRect(both[k], CGRectMake(0, 0, sideWide, side));
+                    CGContextSetBlendMode(both[k], kCGBlendModeCopy);
+                }
                 if (turns[t].shadowX || turns[t].shadowY) {
                     CGColorRef black = CGColorCreateGenericGray(0, 1);
                     CGContextSetShadowWithColor(both[k], CGSizeMake(turns[t].shadowX, turns[t].shadowY), 2, black);
@@ -500,13 +513,15 @@ int main(void)
                     }
                     CGContextTranslateCTM(both[k], placeX, placeY);
                     CGContextRotateCTM(both[k], turns[t].degrees * M_PI / 180);
-                    CGContextDrawImage(both[k], CGRectMake(0, 0, turns[t].rectWidth, turns[t].rectHeight), image);
-                    continue;
+                } else {
+                    CGContextTranslateCTM(both[k], side / 2.0, side / 2.0);
+                    CGContextRotateCTM(both[k], turns[t].degrees * M_PI / 180);
+                    CGContextTranslateCTM(both[k], -turns[t].rectWidth / 2.0, -turns[t].rectHeight / 2.0);
                 }
-                CGContextTranslateCTM(both[k], side / 2.0, side / 2.0);
-                CGContextRotateCTM(both[k], turns[t].degrees * M_PI / 180);
-                CGContextTranslateCTM(both[k], -turns[t].rectWidth / 2.0, -turns[t].rectHeight / 2.0);
                 CGContextDrawImage(both[k], CGRectMake(0, 0, turns[t].rectWidth, turns[t].rectHeight), image);
+                if (turns[t].layerCopy)
+                    CGContextEndTransparencyLayer(both[k]);
+                CGContextRestoreGState(both[k]);
             }
             CGContextFlush(context);
             size_t off = 0;
@@ -514,14 +529,20 @@ int main(void)
             for (int y = 0; y < side; y++) {
                 const uint8_t *row = (const uint8_t *)IOSurfaceGetBaseAddress(surface) + (size_t)y * IOSurfaceGetBytesPerRow(surface);
                 const uint8_t *referenceRow = (const uint8_t *)CGBitmapContextGetData(reference) + (size_t)y * CGBitmapContextGetBytesPerRow(reference);
-                for (int x = 0; x < sideWide; x++)
-                    off += abs((int)row[x * 4 + 3] - (int)referenceRow[x * 4 + 3]) > 40;
+                for (int x = 0; x < sideWide; x++) {
+                    const uint8_t *want = referenceRow + x * 4;
+                    if (turns[t].layerCopy && !(want[0] == 255 && want[1] == 0 && want[2] == 255) && !(want[0] == 0 && want[2] == 0))
+                        continue;
+                    off += abs((int)row[x * 4 + 3] - (int)want[3]) > 40;
+                }
             }
             IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
             char what[160];
             snprintf(what, sizeof what, "%dx%d image at alpha %d into %dx%d turned %g degrees%s%s: %zu pixels off the bitmap's", iw, ih, turns[t].alpha,
                 turns[t].rectWidth, turns[t].rectHeight, turns[t].degrees, turns[t].shadowX || turns[t].shadowY ? ", shadow 150 away" : "",
                 turns[t].placedWidth ? ", edge in view" : "", off);
+            if (turns[t].layerCopy)
+                strlcat(what, " (copy, in a layer)", sizeof what);
             check(!off, what);
             CGContextRelease(reference);
             CGContextRelease(context);

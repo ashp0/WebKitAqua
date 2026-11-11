@@ -1,7 +1,8 @@
 // A focus ring in Core Animation's IOSurface contexts (polyfills/c/CoreGraphics.c), against a CG bitmap's: a path ring, a
 // ring from a transparency layer, a cell's, in a direct surface and an asynchronously drawing layer at scales 1 and 2,
-// inside an offscreen layer, and from a shape just past the surface, whose ring reaches into it. The draw leaves the
-// context's state as a bitmap's does. A ring from a transparency layer past the surface or in an offscreen is reported.
+// inside an offscreen layer, also under copy over the layer's content, and from a shape just past the surface, whose
+// ring reaches into it. The draw leaves the context's state as a bitmap's does. A ring from a transparency layer past
+// the surface or in an offscreen is reported.
 #import <Cocoa/Cocoa.h>
 #import <IOSurface/IOSurface.h>
 #import <QuartzCore/QuartzCore.h>
@@ -80,7 +81,10 @@ static void cellRing(CGContextRef c, CGRect rect)
     NSButtonCell *cell = [[NSButtonCell alloc] initTextCell:@"Button"];
     [cell setButtonType:NSMomentaryPushInButton];
     [cell setBezelStyle:NSRoundedBezelStyle];
-    [cell drawFocusRingMaskWithFrame:rect inView:nil];
+    NSView *view = [[NSView alloc] initWithFrame:NSRectFromCGRect(rect)];
+    [cell drawFocusRingMaskWithFrame:rect inView:view];
+    [view release];
+    [cell release];
     [NSGraphicsContext restoreGraphicsState];
     CGContextEndTransparencyLayer(c);
     CGContextRestoreGState(c);
@@ -241,6 +245,16 @@ int main(void)
                 CGContextEndTransparencyLayer(c);
             }, &changed);
             snprintf(what, sizeof(what), "path ring inside an offscreen layer: within %d of the bitmap (largest %d)", tolerance, largest);
+            check(largest <= tolerance, what);
+            // CoreGraphics composites a ring over its destination under every blend mode.
+            largest = largestDirect(^(CGContextRef c) {
+                CGContextBeginTransparencyLayer(c, NULL);
+                page(c);
+                CGContextSetBlendMode(c, kCGBlendModeCopy);
+                pathRing(c, box);
+                CGContextEndTransparencyLayer(c);
+            }, &changed);
+            snprintf(what, sizeof(what), "path ring under copy inside an offscreen layer over the page: within %d of the bitmap (largest %d)", tolerance, largest);
             check(largest <= tolerance, what);
             largest = largestDirect(^(CGContextRef c) {
                 CGContextBeginTransparencyLayer(c, NULL);

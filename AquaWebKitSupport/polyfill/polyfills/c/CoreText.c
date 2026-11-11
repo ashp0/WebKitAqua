@@ -6938,7 +6938,25 @@ static CGRect wk_colrGlyphBounds(const wk_color_font *f, CGGlyph glyph)
     return CGRectIsNull(united) ? CGRectZero : united;
 }
 
+static void wk_drawGlyphsInBand(CTFontRef font, const CGGlyph *glyphs, const CGPoint *positions, size_t count, CGContextRef context);
+
 WK_POLYFILL_REPLACES("CoreText", void, CTFontDrawGlyphs, (CTFontRef font, const CGGlyph *glyphs, const CGPoint *positions, size_t count, CGContextRef context))
+{
+    wk_device_row_bands bands;
+    if (wk_beginPaintBands(context, wk_textModePaints(CGContextGetTextDrawingMode(context)), &bands)) {
+        while (wk_nextDeviceRowBand(&bands))
+            wk_drawGlyphsInBand(font, glyphs, positions, count, context);
+        if (wk_beginTextClipAfterBands(&bands)) {
+            wk_drawGlyphsInBand(font, glyphs, positions, count, context);
+            wk_endTextClipAfterBands(&bands);
+        }
+        return;
+    }
+    wk_drawGlyphsInBand(font, glyphs, positions, count, context);
+}
+
+// CTFontDrawGlyphs within one band of rows, or the whole draw when it needs no bands.
+static void wk_drawGlyphsInBand(CTFontRef font, const CGGlyph *glyphs, const CGPoint *positions, size_t count, CGContextRef context)
 {
     wk_blend_read_back readBack;
     if (wk_blendReadBackBegin(context, &readBack)) {

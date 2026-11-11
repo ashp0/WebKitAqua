@@ -26,6 +26,24 @@ typedef struct {
 bool wk_blendReadBackBegin(CGContextRef, wk_blend_read_back *);
 void wk_blendReadBackEnd(wk_blend_read_back *);
 
+typedef struct {
+    CGContextRef context;
+    CGAffineTransform ctm;
+    CGRect deviceClip;
+    double bandRows, bandBottom;
+    bool antialias, open;
+    CGPathRef path;
+    CGPoint textPosition;
+    CGTextDrawingMode textMode;
+} wk_device_row_bands;
+enum { WK_PAINTS_FILL = 1, WK_PAINTS_STROKE = 2 };
+bool wk_beginPaintBands(CGContextRef, int paints, wk_device_row_bands *);
+bool wk_nextDeviceRowBand(wk_device_row_bands *);
+bool wk_beginTextClipAfterBands(wk_device_row_bands *);
+void wk_endTextClipAfterBands(wk_device_row_bands *);
+extern CGTextDrawingMode CGContextGetTextDrawingMode(CGContextRef);
+int wk_textModePaints(CGTextDrawingMode);
+
 // After a text draw ended: answers whether its clipping text mode has yet to reach the context, in which case the caller
 // repeats the draw on the context and calls End.
 bool wk_blendReadBackTextClipBegin(wk_blend_read_back *);

@@ -437,6 +437,15 @@ probe_cg_iosurface_row_placement() {
         DYLD_INSERT_LIBRARIES="$T/software_renderer.dylib" "$T/cg_iosurface_row_placement"
 }
 
+probe_cg_iosurface_tall_patterns() {
+    "$CLANG" $MODERN -dynamiclib -DWK_PROBE_SOFTWARE_RENDERER -o "$T/software_renderer.dylib" \
+        "$TBEHAV/CoreGraphics-iosurface-row-placement.c" -framework OpenGL &&
+        "$CLANG" $MODERN $INC -Wno-four-char-constants -Wno-deprecated-declarations -o "$T/cg_iosurface_tall_patterns" \
+        "$TBEHAV/CoreGraphics-iosurface-tall-patterns.c" $PROBE_LIBS -framework CoreGraphics -framework IOSurface &&
+        "$T/cg_iosurface_tall_patterns" &&
+        DYLD_INSERT_LIBRARIES="$T/software_renderer.dylib" "$T/cg_iosurface_tall_patterns"
+}
+
 probe_cg_gradient_dither_space() {
     "$CLANG" $MODERN $INC -o "$T/cg_gradient_dither_space" \
         "$TBEHAV/CoreGraphics-gradient-dither-space.c" $PROBE_LIBS -framework CoreGraphics &&
@@ -1296,6 +1305,7 @@ run_probe cg_iosurface_image_colorspace "$@"
 run_probe cg_iosurface_image_matching "$@"
 run_probe cg_iosurface_image_part "$@"
 run_probe cg_iosurface_row_placement "$@"
+run_probe cg_iosurface_tall_patterns "$@"
 run_probe cg_gradient_dither_space "$@"
 run_probe cg_radial_coinciding "$@"
 run_probe cg_radial_iosurface "$@"
