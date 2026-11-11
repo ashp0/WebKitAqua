@@ -1,24 +1,30 @@
-// The CGContextDrawImage replacement (polyfills/c/CoreGraphics.c) for tall and oversized images in IOSurface
-// contexts. 10.9's software CoreAnimation renderer draws nothing of an image wider or taller than 16384 and steps
-// texture coordinates per destination row in single precision; its accelerated renderer leaves up to a few columns or
-// rows unpainted at the top and right edges of an image over the GPU's texture limit drawn scaled, turned or at a
-// fractional offset. Images whose rows each encode their number -- from memory, from an IOSurface context, under an
-// image mask, without interpolation, and in grey and alpha -- drawn one to one into IOSurfaces up to 16000 rows tall
-// at several offsets land every row in its place, also under a shadow beside them, and under one thousands of rows
-// away within a time budget. A 9021-row image drawn into 512-row surfaces at every tile position lands every row in
-// its place. A 9021-row image of an IOSurface context paints every row of every 512-row tile when drawn as a page
-// tile draws it: flipped, at a device scale of 2, into a surface of another colour space, through the image of
-// matched rows. Images 40000 tall, 40000 wide and 20000 tall shrunk into smaller surfaces paint every pixel, also
-// when the 40000-row one is drawn in two passes, each clipped to part of a surface of another colour space.
-// Translucent images and opaque ones under a context alpha of one half, 20000, 40000 and 100000 rows tall, shrunk to
-// several heights and also turned a quarter, paint every pixel exactly once. Turned 10, 30 and 45 degrees, shrunk to
-// a few pixels, shrunk evenly from 17000 square, shrunk under a shadow 150 pixels away, or with a top or right edge
-// in view enlarged, one to one at a half-pixel origin, or turned 5 degrees, tall and oversized images land within 40
-// levels of alpha of CoreGraphics' own bitmap draw of them, three of them also drawn under the copy blend mode into a
-// transparency layer, off their antialiased edges. 10.9's own draw of 512- and 1024-row windows of a
-// 16000-row image lands in place unaided. The probe runs under the renderer the machine has and again under the
-// software renderer, which built with WK_PROBE_SOFTWARE_RENDERER it forces by failing CGLChoosePixelFormat, as
-// CA::CG::IOSurfaceRenderer::acquire meets it on a Mac without an accelerated renderer.
+// The CGContextDrawImage replacement (polyfills/c/CoreGraphics.c) for tall and oversized images in IOSurface contexts.
+// 10.9's software CoreAnimation renderer draws nothing of an image wider or taller than 16384 and steps texture
+// coordinates per destination row in single precision; its accelerated renderer leaves up to a few columns or rows
+// unpainted at the top and right edges of an image over the GPU's texture limit drawn scaled, turned or at a fractional
+// offset. Images whose rows each encode their number -- from memory, from an IOSurface context, under an image mask,
+// without interpolation, and in grey and alpha -- drawn one to one into IOSurfaces up to 16000 rows tall at several
+// offsets land every row in its place, also under a shadow beside them, and under one thousands of rows away within a
+// time budget. A 9021-row image drawn into 512-row surfaces at every tile position lands every row in its place. A
+// 9021-row image of an IOSurface context paints every row of every 512-row tile when drawn as a page tile draws it:
+// flipped, at a device scale of 2, into a surface of another colour space, through the image of matched rows. Images
+// 40000 tall, 40000 wide and 20000 tall shrunk into smaller surfaces paint every pixel, also when the 40000-row one is
+// drawn in two passes, each clipped to part of a surface of another colour space. Translucent images and opaque ones
+// under a context alpha of one half, 20000, 40000 and 100000 rows tall, shrunk to several heights and also turned a
+// quarter, paint every pixel exactly once. Turned 10, 30 and 45 degrees, shrunk to a few pixels, shrunk evenly from
+// 17000 square, shrunk under a shadow 150 pixels away, or with a top or right edge in view enlarged, one to one at a
+// half-pixel origin, or turned 5 degrees, tall and oversized images land within 40 levels of alpha of CoreGraphics' own
+// bitmap draw of them, three of them also drawn under the copy blend mode into a transparency layer, off their
+// antialiased edges. Colour-graded images 17000 and 17001 square shrunk evenly, 40000 wide shrunk, 20000 wide turned 10
+// degrees, 20000 wide without a byte pointer enlarged and shrunk, and images within the limit and over it shrunk both
+// ways to fractional extents, unturned and turned, land within 8 levels of CoreGraphics' bitmap draw: in alpha
+// everywhere, and in every channel wherever that is opaque; so does an image mask filled red, turned 10 degrees and
+// shrunk to fractional extents. At fractional origins, a small image whose far-edge crop is found only with tolerance
+// and a graded image under alpha one half with a shadow toward its near side, flipped or not, land within 8 levels of
+// alpha. 10.9's own draw of 512- and 1024-row windows of a 16000-row image lands in place unaided. The probe runs under
+// the renderer the machine has and again under the software renderer, which built with WK_PROBE_SOFTWARE_RENDERER it
+// forces by failing CGLChoosePixelFormat, as CA::CG::IOSurfaceRenderer::acquire meets it on a Mac without an
+// accelerated renderer.
 #ifdef WK_PROBE_SOFTWARE_RENDERER
 #include <OpenGL/OpenGL.h>
 #include <stddef.h>
@@ -105,6 +111,41 @@ static void releaseRows(void *info, const void *data, size_t size)
     (void)info;
     (void)size;
     free((void *)data);
+}
+
+// A provider that hands out its bytes in order only, so its images have no byte pointer.
+typedef struct {
+    uint8_t *bytes;
+    size_t size, at;
+} SequentialBytes;
+
+static size_t sequentialGetBytes(void *info, void *buffer, size_t count)
+{
+    SequentialBytes *sequence = info;
+    size_t available = sequence->size - sequence->at < count ? sequence->size - sequence->at : count;
+    memcpy(buffer, sequence->bytes + sequence->at, available);
+    sequence->at += available;
+    return available;
+}
+
+static off_t sequentialSkipForward(void *info, off_t count)
+{
+    SequentialBytes *sequence = info;
+    size_t skipped = sequence->size - sequence->at < (size_t)count ? sequence->size - sequence->at : (size_t)count;
+    sequence->at += skipped;
+    return (off_t)skipped;
+}
+
+static void sequentialRewind(void *info)
+{
+    ((SequentialBytes *)info)->at = 0;
+}
+
+static void sequentialRelease(void *info)
+{
+    SequentialBytes *sequence = info;
+    free(sequence->bytes);
+    free(sequence);
 }
 
 enum ImageKind { kMemory, kSurface, kMasked, kNotInterpolating, kGrayAlpha };
@@ -549,6 +590,203 @@ int main(void)
             CFRelease(surface);
             CGImageRelease(image);
         }
+    }
+
+    // Colour-graded images -- red across, green down, blue falling with both -- against CoreGraphics' bitmap draw: alpha
+    // within 8 levels everywhere, and every channel wherever the bitmap is opaque. Images within the limit shrunk both ways to fractional
+    // extents, unturned and turned, are among them: 10.9's software renderer draws those short at their far edges.
+    // Gradients shrunk into about ten device pixels are compared by alpha only: there 10.9's filter differs from
+    // CoreGraphics' by up to 11 levels of colour on both renderers even at whole extents.
+    {
+        static const struct {
+            int imageWidth, imageHeight;
+            double rectWidth, rectHeight;
+            int surfaceSide;
+            double degrees;
+            bool sequential;
+            bool alphaOnly;
+        } graded[] = {
+            { 17000, 17000, 400, 400, 500, 0, false }, { 17001, 17001, 400, 400, 500, 0, false }, { 40000, 64, 400, 32, 600, 0, false },
+            { 20000, 2000, 400, 40, 600, 10, false }, { 20000, 200, 10000, 100, 2000, 0, true }, { 20000, 200, 400, 40, 600, 0, true },
+            { 1000, 1000, 400.5, 400.5, 500, 0, false }, { 1000, 1000, 400, 400.4, 500, 0, false }, { 1000, 100, 64, 10.3, 100, 0, false, true },
+            { 1000, 100, 64.5, 10, 100, 0, false, true }, { 100, 1000, 10.3, 64, 100, 0, false, true }, { 100000, 2000, 500, 10.3, 600, 0, false, true },
+            { 17001, 17001, 401.25, 400.75, 500, 0, false }, { 1000, 1000, 400.5, 400.5, 600, 10, false }, { 2500, 700, 300.3, 100.7, 400, 33, false },
+            { 4, 4, 2.3, 2.3, 10, 0, false, true }, { 5, 5, 3.4, 3.4, 10, 0, false, true },
+        };
+        for (size_t g = 0; g < sizeof graded / sizeof graded[0]; g++) {
+            int iw = graded[g].imageWidth, ih = graded[g].imageHeight, side = graded[g].surfaceSide;
+            uint8_t *pixels = malloc((size_t)iw * ih * 4);
+            for (int y = 0; y < ih; y++) {
+                for (int x = 0; x < iw; x++) {
+                    uint8_t *p = pixels + ((size_t)y * iw + x) * 4;
+                    p[2] = (uint8_t)(255.0 * x / (iw - 1));
+                    p[1] = (uint8_t)(255.0 * y / (ih - 1));
+                    p[0] = (uint8_t)(255 - (p[1] + p[2]) / 2);
+                    p[3] = 255;
+                }
+            }
+            CGDataProviderRef provider;
+            if (graded[g].sequential) {
+                SequentialBytes *sequence = malloc(sizeof *sequence);
+                *sequence = (SequentialBytes) { pixels, (size_t)iw * ih * 4, 0 };
+                CGDataProviderSequentialCallbacks callbacks = { 0, sequentialGetBytes, sequentialSkipForward, sequentialRewind, sequentialRelease };
+                provider = CGDataProviderCreateSequential(sequence, &callbacks);
+            } else
+                provider = CGDataProviderCreateWithData(NULL, pixels, (size_t)iw * ih * 4, releaseRows);
+            CGImageRef image = CGImageCreate(iw, ih, 8, 32, iw * 4, space, kBGRA, provider, NULL, true, kCGRenderingIntentDefault);
+            CGDataProviderRelease(provider);
+            IOSurfaceRef surface = createSurface(side, side);
+            CGContextRef context = CGIOSurfaceContextCreate(surface, side, side, 8, 32, space, kBGRA);
+            CGContextRef reference = CGBitmapContextCreate(NULL, side, side, 8, side * 4, space, kBGRA);
+            CGContextClearRect(context, CGRectMake(0, 0, side, side));
+            CGContextRef both[2] = { context, reference };
+            for (int k = 0; k < 2; k++) {
+                CGContextTranslateCTM(both[k], side / 2.0, side / 2.0);
+                CGContextRotateCTM(both[k], graded[g].degrees * M_PI / 180);
+                CGContextTranslateCTM(both[k], -graded[g].rectWidth / 2.0, -graded[g].rectHeight / 2.0);
+                CGContextDrawImage(both[k], CGRectMake(0, 0, graded[g].rectWidth, graded[g].rectHeight), image);
+            }
+            CGContextFlush(context);
+            size_t off = 0;
+            int largest = 0;
+            IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+            for (int y = 0; y < side; y++) {
+                const uint8_t *row = (const uint8_t *)IOSurfaceGetBaseAddress(surface) + (size_t)y * IOSurfaceGetBytesPerRow(surface);
+                const uint8_t *referenceRow = (const uint8_t *)CGBitmapContextGetData(reference) + (size_t)y * CGBitmapContextGetBytesPerRow(reference);
+                for (int x = 0; x < side; x++) {
+                    // Alpha everywhere, colour where the bitmap is opaque.
+                    int difference = 0;
+                    for (int c = graded[g].alphaOnly || referenceRow[x * 4 + 3] != 255 ? 3 : 0; c < 4; c++) {
+                        int d = abs((int)row[x * 4 + c] - (int)referenceRow[x * 4 + c]);
+                        difference = d > difference ? d : difference;
+                    }
+                    largest = difference > largest ? difference : largest;
+                    off += difference > 8;
+                }
+            }
+            IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+            char what[160];
+            snprintf(what, sizeof what, "graded %dx%d%s into %gx%g turned %g degrees: %zu pixels over 8 levels off (largest %d)", iw, ih,
+                graded[g].sequential ? " without a byte pointer" : "", graded[g].rectWidth, graded[g].rectHeight, graded[g].degrees, off, largest);
+            check(!off, what);
+            CGContextRelease(reference);
+            CGContextRelease(context);
+            CFRelease(surface);
+            CGImageRelease(image);
+        }
+    }
+
+    // Draws at fractional origins against CoreGraphics' bitmap draw, alpha within 8 levels everywhere: a small image whose
+    // far-edge crop is found only with tolerance, and a colour-graded image under a context alpha of one half with a
+    // shadow toward its near side along one axis or both, in an unflipped and a flipped context, also one more than half
+    // its extent toward its near side, with and without the alpha.
+    {
+        static const struct {
+            int imageWidth, imageHeight;
+            double x, y, width, height;
+            int surfaceSide;
+            bool flipped;
+            double shadowX, shadowY;
+            bool halfAlpha;
+        } placed[] = {
+            { 7, 3, 50.3, 50.6, 3.2, 1.2, 100, false, 0, 0, false }, { 1000, 1000, 50.2, 50.7, 400.3, 400.3, 600, false, 15, -15, true },
+            { 1000, 1000, 50.2, 50.7, 400.3, 400.3, 600, false, -15, -15, true }, { 1000, 1000, 50.2, 150.7, 400.3, 400.3, 600, true, -15, 15, true },
+            { 1000, 1000, 50.2, 150.7, 400.3, 400.3, 600, true, 15, 15, true }, { 200, 200, 50.2, 50.7, 80.3, 80.3, 200, false, -60, 0, true },
+            { 200, 200, 50.2, 50.7, 80.3, 80.3, 200, false, -60, 0, false },
+        };
+        for (size_t g = 0; g < sizeof placed / sizeof placed[0]; g++) {
+            int iw = placed[g].imageWidth, ih = placed[g].imageHeight, side = placed[g].surfaceSide;
+            uint8_t *pixels = malloc((size_t)iw * ih * 4);
+            for (int y = 0; y < ih; y++) {
+                for (int x = 0; x < iw; x++) {
+                    uint8_t *p = pixels + ((size_t)y * iw + x) * 4;
+                    p[2] = (uint8_t)(255.0 * x / (iw - 1));
+                    p[1] = (uint8_t)(255.0 * y / (ih - 1));
+                    p[0] = 128;
+                    p[3] = 255;
+                }
+            }
+            CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, pixels, (size_t)iw * ih * 4, releaseRows);
+            CGImageRef image = CGImageCreate(iw, ih, 8, 32, iw * 4, space, kBGRA, provider, NULL, true, kCGRenderingIntentDefault);
+            CGDataProviderRelease(provider);
+            IOSurfaceRef surface = createSurface(side, side);
+            CGContextRef context = CGIOSurfaceContextCreate(surface, side, side, 8, 32, space, kBGRA);
+            CGContextRef reference = CGBitmapContextCreate(NULL, side, side, 8, side * 4, space, kBGRA);
+            CGContextClearRect(context, CGRectMake(0, 0, side, side));
+            CGContextRef both[2] = { context, reference };
+            for (int k = 0; k < 2; k++) {
+                if (placed[g].flipped) {
+                    CGContextTranslateCTM(both[k], 0, side);
+                    CGContextScaleCTM(both[k], 1, -1);
+                }
+                if (placed[g].halfAlpha)
+                    CGContextSetAlpha(both[k], .5);
+                if (placed[g].shadowX || placed[g].shadowY) {
+                    CGColorRef blue = CGColorCreateGenericRGB(0, 0, 1, 1);
+                    CGContextSetShadowWithColor(both[k], CGSizeMake(placed[g].shadowX, placed[g].shadowY), 0, blue);
+                    CGColorRelease(blue);
+                }
+                CGContextDrawImage(both[k], CGRectMake(placed[g].x, placed[g].y, placed[g].width, placed[g].height), image);
+            }
+            CGContextFlush(context);
+            size_t off = 0;
+            IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+            for (int y = 0; y < side; y++) {
+                const uint8_t *row = (const uint8_t *)IOSurfaceGetBaseAddress(surface) + (size_t)y * IOSurfaceGetBytesPerRow(surface);
+                const uint8_t *referenceRow = (const uint8_t *)CGBitmapContextGetData(reference) + (size_t)y * CGBitmapContextGetBytesPerRow(reference);
+                for (int x = 0; x < side; x++)
+                    off += abs((int)row[x * 4 + 3] - (int)referenceRow[x * 4 + 3]) > 8;
+            }
+            IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+            char what[200];
+            snprintf(what, sizeof what, "%dx%d at %g,%g into %gx%g%s, shadow %g,%g%s: %zu pixels over 8 levels of alpha off", iw, ih, placed[g].x,
+                placed[g].y, placed[g].width, placed[g].height, placed[g].flipped ? " flipped" : "", placed[g].shadowX, placed[g].shadowY,
+                placed[g].halfAlpha ? ", alpha .5" : "", off);
+            check(!off, what);
+            CGContextRelease(reference);
+            CGContextRelease(context);
+            CFRelease(surface);
+            CGImageRelease(image);
+        }
+    }
+
+    // An image mask filled red, turned 10 degrees and shrunk both ways to fractional extents, against CoreGraphics' bitmap
+    // draw: every channel within 8 levels.
+    {
+        int side = 1000, surfaceSide = 600;
+        uint8_t *samples = calloc((size_t)side * side, 1);
+        CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, samples, (size_t)side * side, releaseRows);
+        CGImageRef mask = CGImageMaskCreate(side, side, 8, 8, side, provider, NULL, true);
+        CGDataProviderRelease(provider);
+        IOSurfaceRef surface = createSurface(surfaceSide, surfaceSide);
+        CGContextRef context = CGIOSurfaceContextCreate(surface, surfaceSide, surfaceSide, 8, 32, space, kBGRA);
+        CGContextRef reference = CGBitmapContextCreate(NULL, surfaceSide, surfaceSide, 8, surfaceSide * 4, space, kBGRA);
+        CGContextClearRect(context, CGRectMake(0, 0, surfaceSide, surfaceSide));
+        CGContextRef both[2] = { context, reference };
+        for (int k = 0; k < 2; k++) {
+            CGContextSetRGBFillColor(both[k], 1, 0, 0, 1);
+            CGContextTranslateCTM(both[k], surfaceSide / 2.0, surfaceSide / 2.0);
+            CGContextRotateCTM(both[k], 10 * M_PI / 180);
+            CGContextTranslateCTM(both[k], -400.5 / 2, -400.5 / 2);
+            CGContextDrawImage(both[k], CGRectMake(0, 0, 400.5, 400.5), mask);
+        }
+        CGContextFlush(context);
+        size_t off = 0;
+        IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+        for (int y = 0; y < surfaceSide; y++) {
+            const uint8_t *row = (const uint8_t *)IOSurfaceGetBaseAddress(surface) + (size_t)y * IOSurfaceGetBytesPerRow(surface);
+            const uint8_t *referenceRow = (const uint8_t *)CGBitmapContextGetData(reference) + (size_t)y * CGBitmapContextGetBytesPerRow(reference);
+            for (int x = 0; x < surfaceSide * 4; x++)
+                off += abs((int)row[x] - (int)referenceRow[x]) > 8;
+        }
+        IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+        char what[160];
+        snprintf(what, sizeof what, "image mask filled red, turned 10 degrees into 400.5x400.5: %zu channel values over 8 levels off", off);
+        check(!off, what);
+        CGContextRelease(reference);
+        CGContextRelease(context);
+        CFRelease(surface);
+        CGImageRelease(mask);
     }
 
     // Tiles of another colour space: the rows are matched, so only their coverage is compared.

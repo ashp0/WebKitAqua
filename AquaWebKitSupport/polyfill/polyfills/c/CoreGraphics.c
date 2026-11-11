@@ -2547,6 +2547,8 @@ static bool wk_drawOversizedImageInIOSurface(CGContextRef, CGRect, CGImageRef);
 static CGImageRef wk_copyImageForDraw(CGContextRef, CGRect, CGImageRef, CGColorSpaceRef);
 static const void *wk_imageSurfaceKey(void);
 static bool wk_drawSurfaceImageShownPart(CGContextRef, CGRect, CGImageRef);
+static void wk_drawImageOnSurface(CGContextRef, CGRect, CGImageRef);
+static CGImageRef wk_createReducedImagePart(CGContextRef, CGImageRef, double, double, double, double, double, double);
 static bool wk_insideOffscreenSurfaceLayer(CGContextRef);
 extern void CGContextSetCTM(CGContextRef, CGAffineTransform);
 static IOSurfaceRef wk_createBGRASurface(size_t width, size_t height);
@@ -2644,7 +2646,7 @@ WK_POLYFILL_REPLACES("CoreGraphics", void, CGContextDrawImage, (CGContextRef con
         CGColorSpaceRef colorSpace = CGContextGetColorSpace(context);
         CGImageRef drawn = colorSpace ? wk_copyImageForDraw(context, rect, image, colorSpace) : CGImageRetain(image);
         if (drawn && !wk_drawSurfaceImageShownPart(context, rect, drawn) && !wk_drawOversizedImageInIOSurface(context, rect, drawn))
-            WK_ORIGINAL(CGContextDrawImage)(context, rect, drawn);
+            wk_drawImageOnSurface(context, rect, drawn);
         if (drawn)
             CGImageRelease(drawn);
     } else if (context && image && wk_matchesBitmapDraw(context, image, &bitmapSpace)) {
@@ -2973,6 +2975,269 @@ static CGRect wk_deviceClipBoundingBox(CGContextRef context)
     return box;
 }
 
+// Whether 10.9's software renderer draws the far edge of an extent of `devicePixels` in place: when the extent is
+// whole or its fraction is over a half, so that it rounds up.
+static bool wk_extentKeepsFarEdge(double devicePixels)
+{
+    double fraction = devicePixels - floor(devicePixels);
+    return fraction < 1e-6 || fraction > .5;
+}
+
+// The first crop, in image pixels from `from` moving by `direction` to `bound`, whose distance from the image's far
+// edge `far` at `devicePerImagePixel` keeps the far edge in place, or NAN.
+static double wk_cropKeepingFarEdge(double from, double far, double direction, double bound, double devicePerImagePixel)
+{
+    for (double candidate = from; direction > 0 ? candidate <= bound : candidate >= bound; candidate += direction) {
+        if (wk_extentKeepsFarEdge(fabs(far - candidate) * devicePerImagePixel))
+            return candidate;
+    }
+    return NAN;
+}
+
+// A turned draw the software renderer shrinks along both of the image's axes, which it draws short at its far edges
+// as it does an unturned one, is drawn from the image pixels the clip reaches, with the filter margin and the style
+// reach, reduced by CoreGraphics to at most one pixel to a device pixel along each axis: answers whether it was.
+static bool wk_drawTurnedImageReduced(CGContextRef context, CGRect rect, CGImageRef image)
+{
+    CGAffineTransform ctm = CGContextGetCTM(context);
+    size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+    double alongX = width / (rect.size.width * hypot(ctm.a, ctm.b)), alongY = height / (rect.size.height * hypot(ctm.c, ctm.d));
+    if (!(alongX > 1 && alongY > 1))
+        return false;
+    double pixelsPerUnitX = width / rect.size.width, pixelsPerUnitY = height / rect.size.height;
+    CGAffineTransform toImage = CGAffineTransformConcat(CGAffineTransformInvert(ctm),
+        CGAffineTransformMake(pixelsPerUnitX, 0, 0, -pixelsPerUnitY, -CGRectGetMinX(rect) * pixelsPerUnitX, CGRectGetMaxY(rect) * pixelsPerUnitY));
+    double margin = wk_filterMarginForDraw(context, rect, image) + wk_styleReachInImagePixels(context, rect, image);
+    CGRect pixels = CGRectApplyAffineTransform(CGRectIntegral(wk_deviceClipBoundingBox(context)), toImage);
+    double left = fmax(floor(CGRectGetMinX(pixels) - margin), 0), top = fmax(floor(CGRectGetMinY(pixels) - margin), 0);
+    double right = fmin(ceil(CGRectGetMaxX(pixels) + margin), width), bottom = fmin(ceil(CGRectGetMaxY(pixels) + margin), height);
+    if (right <= left || bottom <= top)
+        return true;
+    CGImageRef part = wk_createReducedImagePart(context, image, alongX, alongY, left, top, right, bottom);
+    if (!part)
+        return false;
+    WK_ORIGINAL(CGContextDrawImage)(context, CGRectMake(CGRectGetMinX(rect) + left / pixelsPerUnitX, CGRectGetMaxY(rect) - bottom / pixelsPerUnitY,
+        (right - left) / pixelsPerUnitX, (bottom - top) / pixelsPerUnitY), part);
+    CGImageRelease(part);
+    return true;
+}
+
+extern int CGStyleGetType(CGStyleRef);
+extern const void *CGStyleGetData(CGStyleRef);
+extern CGAffineTransform CGContextGetBaseCTM(CGContextRef);
+
+// CoreGraphics' shadow style, as CGContextSetShadowWithColor makes it (type 1): its offset in base space is `height`
+// long and points away from `azimuth` degrees (measured).
+typedef struct {
+    unsigned version;
+    CGFloat elevation;
+    CGFloat azimuth;
+    CGFloat ambient;
+    CGFloat height;
+    CGFloat radius;
+} wk_shadow_style;
+enum { wk_styleTypeShadow = 1 };
+
+// The device offset of the context's shadow and the device pixels its blur reaches -- 10.9's software renderer blurs two
+// pixels past the radius, measured: answers false for a context without a shadow.
+static bool wk_deviceShadow(CGContextRef context, CGSize *offset, double *blur)
+{
+    CGStyleRef style = CGContextGetStyle(context);
+    *offset = CGSizeZero;
+    *blur = 0;
+    if (!style || CGStyleGetType(style) != wk_styleTypeShadow)
+        return false;
+    const wk_shadow_style *shadow = (const wk_shadow_style *)CGStyleGetData(style);
+    double turn = shadow->azimuth * M_PI / 180;
+    CGAffineTransform base = CGContextGetBaseCTM(context);
+    *offset = CGSizeApplyAffineTransform(CGSizeMake(-shadow->height * cos(turn), -shadow->height * sin(turn)), base);
+    double radius = shadow->radius * fmax(hypot(base.a, base.b), hypot(base.c, base.d));
+    *blur = radius > 0 ? radius + 2 : 0;
+    return true;
+}
+
+// Up to three device intervals along one axis.
+typedef struct {
+    double from[3], to[3];
+    int count;
+} wk_device_intervals;
+
+static void wk_addInterval(wk_device_intervals *intervals, double from, double to)
+{
+    if (to > from && intervals->count < 3) {
+        intervals->from[intervals->count] = from;
+        intervals->to[intervals->count] = to;
+        intervals->count++;
+    }
+}
+
+// Draws `image` into `rect` clipped without antialiasing to the device pixels the intervals along x and y span together.
+static void wk_drawImageInDeviceIntervals(CGContextRef context, CGRect rect, CGImageRef image, const wk_device_intervals *x, const wk_device_intervals *y)
+{
+    CGRect rects[9];
+    size_t count = 0;
+    for (int i = 0; i < x->count; i++) {
+        for (int j = 0; j < y->count; j++)
+            rects[count++] = CGRectMake(x->from[i], y->from[j], x->to[i] - x->from[i], y->to[j] - y->from[j]);
+    }
+    if (!count)
+        return;
+    CGAffineTransform ctm = CGContextGetCTM(context);
+    bool antialias = CGContextGetShouldAntialias(context);
+    CGContextSaveGState(context);
+    CGContextSetCTM(context, CGAffineTransformIdentity);
+    CGContextSetShouldAntialias(context, false);
+    CGContextClipToRects(context, rects, count);
+    CGContextSetShouldAntialias(context, antialias);
+    CGContextSetCTM(context, ctm);
+    WK_ORIGINAL(CGContextDrawImage)(context, rect, image);
+    CGContextRestoreGState(context);
+}
+
+// Along one axis whose far edge, at device coordinate `far`, lies toward `positive` device coordinates or not, and
+// whose shadow's far edge lies `shadow` device pixels from it: the far intervals, the device pixels within half a pixel
+// of either far edge and, for the image's, those past it; the near intervals, the rest; and the span a part reaching
+// the far edge covers to reach both.
+static double wk_farIntervals(double far, bool positive, double shadow, wk_device_intervals *farIntervals, wk_device_intervals *nearIntervals)
+{
+    static const double away = 1e7;
+    double imageStart = positive ? floor(far - .5) : ceil(far + .5);
+    double shadowEdge = far + shadow;
+    double shadowFrom = positive ? floor(shadowEdge - .5) : ceil(shadowEdge + .5), shadowTo = positive ? ceil(shadowEdge) : floor(shadowEdge);
+    double span = fabs(far - imageStart);
+    double imageFrom = positive ? imageStart : -away, imageTo = positive ? away : imageStart;
+    farIntervals->count = nearIntervals->count = 0;
+    wk_addInterval(farIntervals, imageFrom, imageTo);
+    if (shadow) {
+        // The part of the shadow's far region outside the image's.
+        double from = fmin(shadowFrom, shadowTo), to = fmax(shadowFrom, shadowTo);
+        if (positive)
+            to = fmin(to, imageFrom);
+        else
+            from = fmax(from, imageTo);
+        if (to > from) {
+            wk_addInterval(farIntervals, from, to);
+            span = fmax(span, fabs(far - (positive ? from : to)));
+        }
+    }
+    // The near intervals: everything outside the far ones, which are disjoint and sorted here by position.
+    double cuts[6];
+    int cutCount = 0;
+    for (int i = 0; i < farIntervals->count; i++) {
+        cuts[cutCount++] = farIntervals->from[i];
+        cuts[cutCount++] = farIntervals->to[i];
+    }
+    for (int i = 0; i < cutCount; i++) {
+        for (int j = i + 1; j < cutCount; j++) {
+            if (cuts[j] < cuts[i]) {
+                double t = cuts[i];
+                cuts[i] = cuts[j];
+                cuts[j] = t;
+            }
+        }
+    }
+    double position = -away;
+    for (int i = 0; i + 1 < cutCount; i += 2) {
+        wk_addInterval(nearIntervals, position, cuts[i]);
+        position = cuts[i + 1];
+    }
+    wk_addInterval(nearIntervals, position, away);
+    return span;
+}
+
+// 10.9's software renderer draws an image it shrinks by more than about 1.3 times along both axes, measured, with its
+// device width and height rounded to whole pixels from the rect's origin and clipped to the rect, so a far edge, the
+// top or right in user space, whose extent has a fraction of a half or less is drawn up to half a pixel short, and so
+// is the far edge of its shadow. A turned draw shrinking along both of the image's axes is drawn reduced, at every
+// extent (wk_drawTurnedImageReduced). An unturned draw shrinking along both axes is split along each axis whose extent
+// has such a fraction and whose image has a crop keeping the edge: it is made whole, clipped short of the device
+// pixels within half a pixel of the far edge and of its shadow's, and those from a part of the image reaching that
+// edge whose extent keeps it. A part carries the pixels its shadow casts into the far intervals (or another style's
+// reach) and, where the image has the pixels for it, the filter margin; along an axis without such a crop the draw
+// keeps the system's edge.
+static void wk_drawImageOnSurface(CGContextRef context, CGRect rect, CGImageRef image)
+{
+    CGAffineTransform ctm = CGContextGetCTM(context);
+    size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+    if (!wk_hasAcceleratedCoreAnimationRenderer() && (ctm.b != 0 || ctm.c != 0) && rect.size.width > 0 && rect.size.height > 0
+        && wk_drawTurnedImageReduced(context, rect, image))
+        return;
+    if (wk_hasAcceleratedCoreAnimationRenderer() || ctm.b != 0 || ctm.c != 0 || !(rect.size.width > 0) || !(rect.size.height > 0)) {
+        WK_ORIGINAL(CGContextDrawImage)(context, rect, image);
+        return;
+    }
+    double deviceWidth = fabs(ctm.a) * rect.size.width, deviceHeight = fabs(ctm.d) * rect.size.height;
+    bool splitsX = !wk_extentKeepsFarEdge(deviceWidth), splitsY = !wk_extentKeepsFarEdge(deviceHeight);
+    if (!(width > deviceWidth && height > deviceHeight) || (!splitsX && !splitsY)) {
+        WK_ORIGINAL(CGContextDrawImage)(context, rect, image);
+        return;
+    }
+    double farX = ctm.a * CGRectGetMaxX(rect) + ctm.tx, farY = ctm.d * CGRectGetMaxY(rect) + ctm.ty;
+    double devicePerPixelX = deviceWidth / width, devicePerPixelY = deviceHeight / height;
+    double filterMargin = wk_filterMarginForDraw(context, rect, image);
+    CGSize shadow;
+    double blur;
+    bool shadowed = wk_deviceShadow(context, &shadow, &blur);
+    wk_device_intervals farXs, nearXs, farYs, nearYs;
+    double spanX = wk_farIntervals(farX, ctm.a > 0, shadow.width, &farXs, &nearXs);
+    double spanY = wk_farIntervals(farY, ctm.d > 0, shadow.height, &farYs, &nearYs);
+    // A part reaches the far intervals' image pixels and, for a shadow, those its shadow casts into them from farther
+    // in: the shadow's offset toward the far edge and its blur. Another style reaches its whole reach.
+    double extraX, extraY;
+    if (shadowed) {
+        extraX = fmax(ctm.a > 0 ? shadow.width : -shadow.width, 0) + blur;
+        extraY = fmax(ctm.d > 0 ? shadow.height : -shadow.height, 0) + blur;
+    } else {
+        double reach = wk_styleReachInImagePixels(context, rect, image);
+        extraX = reach * devicePerPixelX;
+        extraY = reach * devicePerPixelY;
+    }
+    spanX += extraX;
+    spanY += extraY;
+    // Parts reaching the far edges: columns from `left` to the right edge, rows from the top edge to `bottom`. Crops
+    // are rounded with the tolerance the extents are judged by.
+    double left = 0, bottom = height;
+    if (splitsX) {
+        left = wk_cropKeepingFarEdge(fmax(floor(width - spanX / devicePerPixelX - filterMargin + 1e-6), 0), width, -1, 0, devicePerPixelX);
+        if (isnan(left))
+            left = wk_cropKeepingFarEdge(fmax(floor(width - spanX / devicePerPixelX + 1e-6), 0), width, -1, 0, devicePerPixelX);
+        splitsX = !isnan(left);
+    }
+    if (splitsY) {
+        bottom = wk_cropKeepingFarEdge(fmin(ceil(spanY / devicePerPixelY + filterMargin - 1e-6), height), 0, 1, height, devicePerPixelY);
+        if (isnan(bottom))
+            bottom = wk_cropKeepingFarEdge(fmin(ceil(spanY / devicePerPixelY - 1e-6), height), 0, 1, height, devicePerPixelY);
+        splitsY = !isnan(bottom);
+    }
+    if (!splitsX && !splitsY) {
+        WK_ORIGINAL(CGContextDrawImage)(context, rect, image);
+        return;
+    }
+    wk_device_intervals everywhere = { { -1e7 }, { 1e7 }, 1 }, none = { { 0 }, { 0 }, 0 };
+    if (!splitsX) {
+        nearXs = everywhere;
+        farXs = none;
+    }
+    if (!splitsY) {
+        nearYs = everywhere;
+        farYs = none;
+    }
+    wk_drawImageInDeviceIntervals(context, rect, image, &nearXs, &nearYs);
+    for (int which = 0; which < 3; which++) {
+        bool columns = which != 1, rows = which != 0;
+        if ((columns && !splitsX) || (rows && !splitsY))
+            continue;
+        double partLeft = columns ? left : 0, partBottom = rows ? bottom : height;
+        CGImageRef part = CGImageCreateWithImageInRect(image, CGRectMake(partLeft, 0, width - partLeft, partBottom));
+        if (!part)
+            continue;
+        CGRect partRect = CGRectMake(CGRectGetMinX(rect) + partLeft * rect.size.width / width, CGRectGetMaxY(rect) - partBottom * rect.size.height / height,
+            (width - partLeft) * rect.size.width / width, partBottom * rect.size.height / height);
+        wk_drawImageInDeviceIntervals(context, partRect, part, columns ? &farXs : &nearXs, rows ? &farYs : &nearYs);
+        CGImageRelease(part);
+    }
+}
+
 // Bands of `deviceClip`'s rows few enough that a draw of a texture `extent` pixels along its stepped coordinates lands
 // in place. wk_nextDeviceRowBand clips the context without antialiasing to the next band, with the current path and
 // text position the draw started with and a clipping text mode's painting mode, and answers false after the last.
@@ -3030,14 +3295,36 @@ static void wk_drawInDeviceRowBands(CGContextRef context, CGRect rect, CGImageRe
 }
 
 // Image pixels `left`, `top` to `right`, `bottom` of `image`, drawn by CoreGraphics with the context's interpolation
-// quality into an image of the context's colour space within the texture limit and about two of its pixels to a
-// device pixel of the draw `toImage` maps device space from.
-static CGImageRef wk_createReducedImagePart(CGContextRef context, CGImageRef image, CGAffineTransform toImage, double left, double top, double right, double bottom)
+// quality into an image of the context's colour space within the texture limit, `reduceX` by `reduceY` image pixels to
+// each of its pixels. An image mask is reduced into an image mask: painted black through it over white, which are its
+// samples.
+static CGImageRef wk_createReducedImagePart(CGContextRef context, CGImageRef image, double reduceX, double reduceY, double left, double top, double right, double bottom)
 {
     double limit = wk_imageTextureLimit() - 2;
     double partWidth = right - left, partHeight = bottom - top;
-    double reducedWidth = fmin(ceil(partWidth / fmax(floor(hypot(toImage.a, toImage.c) / 2), 1)), limit);
-    double reducedHeight = fmin(ceil(partHeight / fmax(floor(hypot(toImage.b, toImage.d) / 2), 1)), limit);
+    double reducedWidth = fmin(ceil(partWidth / reduceX), limit), reducedHeight = fmin(ceil(partHeight / reduceY), limit);
+    double scaleX = reducedWidth / partWidth, scaleY = reducedHeight / partHeight;
+    CGRect drawn = CGRectMake(-left * scaleX, (bottom - CGImageGetHeight(image)) * scaleY, CGImageGetWidth(image) * scaleX, CGImageGetHeight(image) * scaleY);
+    if (CGImageIsMask(image)) {
+        CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
+        CGContextRef samples = gray ? CGBitmapContextCreate(NULL, (size_t)reducedWidth, (size_t)reducedHeight, 8, 0, gray, (CGBitmapInfo)kCGImageAlphaNone) : NULL;
+        if (gray)
+            CGColorSpaceRelease(gray);
+        if (!samples)
+            return NULL;
+        CGContextSetGrayFillColor(samples, 1, 1);
+        CGContextFillRect(samples, CGRectMake(0, 0, reducedWidth, reducedHeight));
+        CGContextSetGrayFillColor(samples, 0, 1);
+        CGContextSetInterpolationQuality(samples, CGContextGetInterpolationQuality(context));
+        WK_ORIGINAL(CGContextDrawImage)(samples, drawn, image);
+        CGImageRef sampled = CGBitmapContextCreateImage(samples);
+        CGContextRelease(samples);
+        CGImageRef mask = sampled ? CGImageMaskCreate(CGImageGetWidth(sampled), CGImageGetHeight(sampled), 8, 8, CGImageGetBytesPerRow(sampled),
+            CGImageGetDataProvider(sampled), NULL, CGImageGetShouldInterpolate(image)) : NULL;
+        if (sampled)
+            CGImageRelease(sampled);
+        return mask;
+    }
     CGColorSpaceRef colorSpace = CGContextGetColorSpace(context);
     if (!colorSpace || CGColorSpaceGetModel(colorSpace) != kCGColorSpaceModelRGB)
         colorSpace = CGImageGetColorSpace(image);
@@ -3049,10 +3336,8 @@ static CGImageRef wk_createReducedImagePart(CGContextRef context, CGImageRef ima
         CGColorSpaceRelease(sRGB);
     if (!bitmap)
         return NULL;
-    double scaleX = reducedWidth / partWidth, scaleY = reducedHeight / partHeight;
     CGContextSetInterpolationQuality(bitmap, CGContextGetInterpolationQuality(context));
-    WK_ORIGINAL(CGContextDrawImage)(bitmap, CGRectMake(-left * scaleX, (bottom - CGImageGetHeight(image)) * scaleY,
-        CGImageGetWidth(image) * scaleX, CGImageGetHeight(image) * scaleY), image);
+    WK_ORIGINAL(CGContextDrawImage)(bitmap, drawn, image);
     CGImageRef reduced = CGBitmapContextCreateImage(bitmap);
     CGContextRelease(bitmap);
     if (reduced && !CGImageGetShouldInterpolate(image)) {
@@ -3077,7 +3362,7 @@ static bool wk_drawOversizedImageInIOSurface(CGContextRef context, CGRect rect, 
     if (width <= limit && height <= limit) {
         if (!software || wk_softwareRendererPlacesExactly(wk_steppedDeviceRows(context, rect), wk_steppedExtent(ctm, width, height)))
             return false;
-        wk_drawInDeviceRowBands(context, rect, image, WK_ORIGINAL(CGContextDrawImage));
+        wk_drawInDeviceRowBands(context, rect, image, wk_drawImageOnSurface);
         return true;
     }
     if (!software) {
@@ -3121,7 +3406,8 @@ static bool wk_drawOversizedImageInIOSurface(CGContextRef context, CGRect rect, 
                 continue;
             CGImageRef part = NULL;
             if (reduces)
-                part = wk_createReducedImagePart(context, image, toImage, partLeft, partTop, partRight, partBottom);
+                part = wk_createReducedImagePart(context, image, fmax(floor(hypot(toImage.a, toImage.c) / 2), 1), fmax(floor(hypot(toImage.b, toImage.d) / 2), 1),
+                    partLeft, partTop, partRight, partBottom);
             else if (!(part = wk_createImagePartOverBytes(image, partLeft, partTop, partRight, partBottom))) {
                 if (software)
                     part = CGImageCreateWithImageInRect(image, CGRectMake(partLeft, partTop, partRight - partLeft, partBottom - partTop));
@@ -3140,9 +3426,9 @@ static bool wk_drawOversizedImageInIOSurface(CGContextRef context, CGRect rect, 
             CGContextSetCTM(context, ctm);
             if (software && !wk_softwareRendererPlacesExactly(wk_steppedDeviceRows(context, partRect),
                 wk_steppedExtent(ctm, CGImageGetWidth(part), CGImageGetHeight(part))))
-                wk_drawInDeviceRowBands(context, partRect, part, WK_ORIGINAL(CGContextDrawImage));
+                wk_drawInDeviceRowBands(context, partRect, part, wk_drawImageOnSurface);
             else
-                WK_ORIGINAL(CGContextDrawImage)(context, partRect, part);
+                wk_drawImageOnSurface(context, partRect, part);
             CGContextRestoreGState(context);
             CGImageRelease(part);
         }
