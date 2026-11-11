@@ -3921,7 +3921,7 @@ bool wk_blendReadBackBegin(CGContextRef context, wk_blend_read_back *readBack)
     bool takesReadBack = wk_modeTakesReadBack(context, mode), dropsStyle = surface && style && wk_dropsStyle(style);
     if (!takesReadBack && !dropsStyle)
         return false;
-    bool blends = (takesReadBack || (dropsStyle && mode != kCGBlendModeNormal)) && !wk_insideOffscreenSurfaceLayer(context);
+    bool blends = !wk_insideOffscreenSurfaceLayer(context);
     if (!blends && !dropsStyle)
         return false;
     if (style || !surface)
