@@ -419,6 +419,12 @@ probe_cg_iosurface_image_matching() {
         "$T/cg_iosurface_image_matching" "$REPO/Source/ThirdParty/skia/resources/icc_profiles/srgb_lab_pcs.icc"
 }
 
+probe_cg_iosurface_image_part() {
+    "$CLANG" $MODERN $INC -Wno-four-char-constants -o "$T/cg_iosurface_image_part" \
+        "$TBEHAV/CoreGraphics-iosurface-image-part.c" $PROBE_LIBS -framework CoreGraphics -framework IOSurface &&
+        "$T/cg_iosurface_image_part"
+}
+
 probe_cg_gradient_dither_space() {
     "$CLANG" $MODERN $INC -o "$T/cg_gradient_dither_space" \
         "$TBEHAV/CoreGraphics-gradient-dither-space.c" $PROBE_LIBS -framework CoreGraphics &&
@@ -1276,6 +1282,7 @@ run_probe stroke_line_segments "$@"
 run_probe ax_client_identification "$@"
 run_probe cg_iosurface_image_colorspace "$@"
 run_probe cg_iosurface_image_matching "$@"
+run_probe cg_iosurface_image_part "$@"
 run_probe cg_gradient_dither_space "$@"
 run_probe cg_radial_coinciding "$@"
 run_probe cg_radial_iosurface "$@"

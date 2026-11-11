@@ -2512,6 +2512,7 @@ size_t wk_coreAnimationTextureLimit(void)
 static bool wk_drawOversizedImageInIOSurface(CGContextRef, CGRect, CGImageRef);
 static CGImageRef wk_copyImageForDraw(CGContextRef, CGRect, CGImageRef, CGColorSpaceRef);
 static const void *wk_imageSurfaceKey(void);
+static bool wk_drawSurfaceImageShownPart(CGContextRef, CGRect, CGImageRef);
 
 // Direct IOSurface contexts and asynchronous CA layer contexts share this renderer delegate.
 extern CGContextRef CGIOSurfaceContextCreate(IOSurfaceRef, size_t, size_t, size_t, size_t, CGColorSpaceRef, CGBitmapInfo);
@@ -2604,7 +2605,7 @@ WK_POLYFILL_REPLACES("CoreGraphics", void, CGContextDrawImage, (CGContextRef con
     if (context && image && wk_drawsThroughCoreAnimationIOSurface(context)) {
         CGColorSpaceRef colorSpace = CGContextGetColorSpace(context);
         CGImageRef drawn = colorSpace ? wk_copyImageForDraw(context, rect, image, colorSpace) : CGImageRetain(image);
-        if (drawn && !wk_drawOversizedImageInIOSurface(context, rect, drawn))
+        if (drawn && !wk_drawSurfaceImageShownPart(context, rect, drawn) && !wk_drawOversizedImageInIOSurface(context, rect, drawn))
             WK_ORIGINAL(CGContextDrawImage)(context, rect, drawn);
         if (drawn)
             CGImageRelease(drawn);
@@ -3021,6 +3022,65 @@ static CGImageRef wk_copyImageForDraw(CGContextRef context, CGRect rect, CGImage
         return rowsImage;
     CGImageRef whole = wk_imageForDestinationColorSpace(image, colorSpace);
     return CGImageRetain(whole ? whole : image);
+}
+
+// QuartzCore keeps a drawn image until the context's queue renders it, and an image of an IOSurface context
+// whose context draws again meanwhile is detached into a copy of the whole surface, read back from the GPU
+// under the accelerated renderer. A draw that maps an image of an IOSurface context onto whole device pixels
+// one to one -- no scale, rotation or flip, a whole-pixel offset -- and carries no style paints the same pixels
+// from the part of the image its clip shows; under a shadow it does not. That part is copied out of the image
+// by QuartzCore into a surface of its own and drawn instead; an image or part over the renderer's texture limit
+// goes through wk_drawOversizedImageInIOSurface. The software renderer places the rows of an image 8193 to 16383
+// pixels tall a row or two off, so an image over 8192 pixels tall is drawn whole there. Answers whether the
+// draw was made here.
+static bool wk_drawSurfaceImageShownPart(CGContextRef context, CGRect rect, CGImageRef image)
+{
+    size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+    if (!objc_getAssociatedObject((id)image, wk_imageSurfaceKey()) || CGImageGetBitmapInfo(image) != wk_bgraInfo
+        || rect.size.width != (CGFloat)width || rect.size.height != (CGFloat)height
+        || (!wk_hasAcceleratedCoreAnimationRenderer() && height > 8192))
+        return false;
+    CGAffineTransform ctm = CGContextGetCTM(context);
+    double originX = ctm.tx + rect.origin.x, originY = ctm.ty + rect.origin.y;
+    if (ctm.a != 1 || ctm.b != 0 || ctm.c != 0 || ctm.d != 1 || originX != floor(originX) || originY != floor(originY)
+        || CGContextGetStyle(context))
+        return false;
+
+    CGRect visible = wk_visiblePartOfDraw(context, rect);
+    if (CGRectIsEmpty(visible))
+        return true;
+    double left = fmax(floor(CGRectGetMinX(visible) - CGRectGetMinX(rect)), 0);
+    double right = fmin(ceil(CGRectGetMaxX(visible) - CGRectGetMinX(rect)), width);
+    double top = fmax(floor(CGRectGetMaxY(rect) - CGRectGetMaxY(visible)), 0);
+    double bottom = fmin(ceil(CGRectGetMaxY(rect) - CGRectGetMinY(visible)), height);
+    if (right <= left || bottom <= top)
+        return true;
+    if (left == 0 && top == 0 && right == width && bottom == height)
+        return false;
+
+    size_t partWidth = (size_t)(right - left), partHeight = (size_t)(bottom - top);
+    IOSurfaceRef surface = wk_createBGRASurface(partWidth, partHeight);
+    CGContextRef partContext = surface ? CGIOSurfaceContextCreate(surface, partWidth, partHeight, 8, 32, CGImageGetColorSpace(image), wk_bgraInfo) : NULL;
+    CGImageRef part = NULL;
+    if (partContext) {
+        CGContextSetBlendMode(partContext, kCGBlendModeCopy);
+        CGContextSetInterpolationQuality(partContext, kCGInterpolationNone);
+        CGRect imageRect = CGRectMake(-left, bottom - height, width, height);
+        if (!wk_drawOversizedImageInIOSurface(partContext, imageRect, image))
+            WK_ORIGINAL(CGContextDrawImage)(partContext, imageRect, image);
+        CGContextFlush(partContext);
+        part = WK_ORIGINAL(CGIOSurfaceContextCreateImage)(partContext);
+        CGContextRelease(partContext);
+    }
+    if (surface)
+        CFRelease(surface);
+    if (!part)
+        return false;
+    CGRect partRect = CGRectMake(CGRectGetMinX(rect) + left, CGRectGetMaxY(rect) - bottom, partWidth, partHeight);
+    if (!wk_drawOversizedImageInIOSurface(context, partRect, part))
+        WK_ORIGINAL(CGContextDrawImage)(context, partRect, part);
+    CGImageRelease(part);
+    return true;
 }
 
 // CGContextDrawTiledImage and the pattern setters below draw a private copy of the pixels of a
