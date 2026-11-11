@@ -8,13 +8,16 @@
 // straight-alpha one as that route matches it, within two levels. Translucent images of other matrix-shaper pairs land within one level of
 // CoreGraphics' own match of them widened to 16 bits, and so do one in a space ColorSync describes by tables,
 // drawn into an 8-bit bitmap.
-// An image wider than the renderer's texture limit is matched across the parts it is drawn in. A partially
+// An image wider than the renderer's texture limit is matched across the parts it is drawn in, and one whose
+// draws read only some of its rows, however tall, is matched draw by draw as they are. A partially
 // decoded CMYK JPEG, built as JPEGImageDecoder::createNativeImage builds it (an opaque CMYK
 // image under CGImageCreateWithMask), paints only its decoded rows.
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <IOSurface/IOSurface.h>
 #include <mach-o/dyld.h>
+#include <objc/runtime.h>
+#include <dlfcn.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -22,6 +25,7 @@
 #include <string.h>
 
 CGContextRef CGIOSurfaceContextCreate(IOSurfaceRef, size_t, size_t, size_t, size_t, CGColorSpaceRef, CGBitmapInfo);
+CGImageRef CGIOSurfaceContextCreateImage(CGContextRef);
 typedef void (*DrawImageFn)(CGContextRef, CGRect, CGImageRef);
 
 static const CGBitmapInfo kBGRA = (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little;
@@ -132,6 +136,20 @@ static void archiveDraw(CGContextRef context, CGRect rect, CGImageRef image)
 int main(int argc, char **argv)
 {
     DrawImageFn system = systemDrawImage();
+    {
+        // The renderer QuartzCore draws IOSurface contexts with, chosen as CA::CG::IOSurfaceRenderer::acquire chooses it.
+        typedef int (*ChooseFn)(const int *, void **, int *);
+        typedef int (*CreateFn)(void *, void *, void **);
+        void *gl = dlopen("/System/Library/Frameworks/OpenGL.framework/OpenGL", RTLD_LAZY);
+        ChooseFn choose = gl ? (ChooseFn)dlsym(gl, "CGLChoosePixelFormat") : NULL;
+        CreateFn create = gl ? (CreateFn)dlsym(gl, "CGLCreateContext") : NULL;
+        static const int attributes[] = { 8, 32, 73, 72, 96, 1262, 0 };
+        void *pixelFormat = NULL, *glContext = NULL;
+        int formats = 0;
+        bool accelerated = choose && create && !choose(attributes, &pixelFormat, &formats) && pixelFormat && formats > 0
+            && !create(pixelFormat, NULL, &glContext) && glContext;
+        printf("    QuartzCore renderer: %s\n", accelerated ? "accelerated" : "software");
+    }
     CGColorSpaceRef linear = createLinearSRGB();
     CGColorSpaceRef sRGB = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     if (!system || !linear || !sRGB)
@@ -425,6 +443,366 @@ int main(int argc, char **argv)
         CGContextRelease(context);
         CFRelease(surface);
         CGImageRelease(image);
+    }
+
+    // An image whose draws each read only some of its rows has those rows matched draw by draw. Painted in
+    // three bands as tiles are -- a translucent linear-sRGB image of varied pixels, 8- and 16-bit, at scales
+    // that magnify, shrink and keep it, at every interpolation quality, into an sRGB IOSurface and an sRGB
+    // 8-bit bitmap -- it lands what the same bands land once every row of it is matched, within one level or
+    // what 10.9 itself varies by. The reference is another newly made image.
+    {
+        enum { kImageWidth = 300, kImageHeight = 900, kSurfaceWidth = 640, kSurfaceHeight = 420 };
+        static const double scales[] = { 1, 2, 1.37, 0.78, 0.31 };
+        static const CGInterpolationQuality qualities[] = { kCGInterpolationDefault, kCGInterpolationNone, kCGInterpolationMedium, kCGInterpolationHigh };
+        static const CGRect bands[] = { { { 37, 23 }, { 261, 47 } }, { { 37, 70 }, { 261, 113 } }, { { 37, 183 }, { 261, 200 } } };
+        size_t rowBytes8 = kImageWidth * 4, rowBytes16 = kImageWidth * 8;
+        unsigned char *pixels8 = malloc(kImageHeight * rowBytes8);
+        uint16_t *pixels16 = malloc(kImageHeight * rowBytes16);
+        for (size_t y = 0; y < kImageHeight; y++) {
+            for (size_t x = 0; x < kImageWidth; x++) {
+                unsigned alpha = 40 + (x * 7 + y * 13) % 216;
+                unsigned colour[3] = { (x * 31 + y * 3) % 256, (x * 5 + y * 17) % 256, (x * y) % 256 };
+                unsigned char *p = pixels8 + y * rowBytes8 + x * 4;
+                uint16_t *q = pixels16 + (y * kImageWidth + x) * 4;
+                for (int c = 0; c < 3; c++) {
+                    p[2 - c] = (unsigned char)(colour[c] * alpha / 255);
+                    q[c] = (uint16_t)(colour[c] * alpha / 255 * 257);
+                }
+                p[3] = (unsigned char)alpha;
+                q[3] = (uint16_t)(alpha * 257);
+            }
+        }
+        // The reference has every row matched first, by a draw that reads one row and then one that reads all
+        // of them. A 16-bit image takes the whole matched image on both sides, so its differences are 10.9's own.
+        int worst[2] = { 0, 0 }, unmatchedByRows = 0;
+        {
+            for (int sixteen = 0; sixteen < 2; sixteen++) {
+                for (size_t s = 0; s < sizeof scales / sizeof *scales; s++) {
+                    for (size_t q = 0; q < sizeof qualities / sizeof *qualities; q++) {
+                        for (int bitmapDestination = 0; bitmapDestination < 2; bitmapDestination++) {
+                            unsigned char *results[2];
+                            for (int drawByDraw = 0; drawByDraw < 2; drawByDraw++) {
+                                CGDataProviderRef provider = sixteen
+                                    ? CGDataProviderCreateWithData(NULL, pixels16, kImageHeight * rowBytes16, NULL)
+                                    : CGDataProviderCreateWithData(NULL, pixels8, kImageHeight * rowBytes8, NULL);
+                                CGImageRef image = sixteen
+                                    ? CGImageCreate(kImageWidth, kImageHeight, 16, 64, rowBytes16, linear,
+                                        kCGBitmapByteOrder16Host | (CGBitmapInfo)kCGImageAlphaPremultipliedLast, provider, NULL, true, kCGRenderingIntentDefault)
+                                    : CGImageCreate(kImageWidth, kImageHeight, 8, 32, rowBytes8, linear, kBGRA, provider, NULL, true, kCGRenderingIntentDefault);
+                                CGDataProviderRelease(provider);
+                                // One row of each image is drawn first, and then all of the reference.
+                                IOSurfaceRef scratch = createSurface(kImageWidth, kImageHeight);
+                                CGContextRef whole = CGIOSurfaceContextCreate(scratch, kImageWidth, kImageHeight, 8, 32, sRGB, kBGRA);
+                                CGContextSaveGState(whole);
+                                CGContextClipToRect(whole, CGRectMake(0, 0, kImageWidth, 1));
+                                CGContextDrawImage(whole, CGRectMake(0, 0, kImageWidth, kImageHeight), image);
+                                CGContextRestoreGState(whole);
+                                if (!drawByDraw)
+                                    CGContextDrawImage(whole, CGRectMake(0, 0, kImageWidth, kImageHeight), image);
+                                CGContextFlush(whole);
+                                CGContextRelease(whole);
+                                CFRelease(scratch);
+                                IOSurfaceRef surface = bitmapDestination ? NULL : createSurface(kSurfaceWidth, kSurfaceHeight);
+                                unsigned char *bitmapPixels = bitmapDestination ? calloc(kSurfaceHeight, kSurfaceWidth * 4) : NULL;
+                                CGContextRef context = bitmapDestination
+                                    ? CGBitmapContextCreate(bitmapPixels, kSurfaceWidth, kSurfaceHeight, 8, kSurfaceWidth * 4, sRGB, kBGRA)
+                                    : CGIOSurfaceContextCreate(surface, kSurfaceWidth, kSurfaceHeight, 8, 32, sRGB, kBGRA);
+                                CGContextClearRect(context, CGRectMake(0, 0, kSurfaceWidth, kSurfaceHeight));
+                                CGContextSetInterpolationQuality(context, qualities[q]);
+                                // Edges on whole pixels: 10.9 paints a partly covered edge pixel of a shrunk image by
+                                // what it has drawn of the image before, whichever way it is matched.
+                                CGRect rect = CGRectMake(5, -4, kImageWidth * scales[s], kImageHeight * scales[s]);
+                                for (size_t b = 0; b < sizeof bands / sizeof *bands; b++) {
+                                    CGContextSaveGState(context);
+                                    CGContextClipToRect(context, bands[b]);
+                                    CGContextDrawImage(context, rect, image);
+                                    CGContextRestoreGState(context);
+                                }
+                                CGContextFlush(context);
+                                if (!sixteen && !bitmapDestination && !objc_getAssociatedObject((id)image, sel_registerName("wk_ioSurfaceImageRows")))
+                                    unmatchedByRows++;
+                                results[drawByDraw] = malloc(kSurfaceHeight * kSurfaceWidth * 4);
+                                if (bitmapDestination)
+                                    memcpy(results[drawByDraw], bitmapPixels, kSurfaceHeight * kSurfaceWidth * 4);
+                                else {
+                                    IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+                                    const unsigned char *base = IOSurfaceGetBaseAddress(surface);
+                                    size_t surfaceRowBytes = IOSurfaceGetBytesPerRow(surface);
+                                    for (size_t y = 0; y < kSurfaceHeight; y++)
+                                        memcpy(results[drawByDraw] + y * kSurfaceWidth * 4, base + y * surfaceRowBytes, kSurfaceWidth * 4);
+                                    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+                                }
+                                CGContextRelease(context);
+                                if (surface)
+                                    CFRelease(surface);
+                                free(bitmapPixels);
+                                CGImageRelease(image);
+                            }
+                            for (size_t i = 0; i < kSurfaceHeight * kSurfaceWidth * 4; i++) {
+                                int difference = abs((int)results[0][i] - (int)results[1][i]);
+                                if (difference > worst[sixteen])
+                                    worst[sixteen] = difference;
+                            }
+                            free(results[0]);
+                            free(results[1]);
+                        }
+                    }
+                }
+            }
+        }
+        free(pixels8);
+        free(pixels16);
+        printf("    banded draws, worst level difference from every row matched first: %d (16-bit, 10.9's own: %d)\n", worst[0], worst[1]);
+        check(!unmatchedByRows, "an 8-bit image drawn into an IOSurface has its rows matched");
+        check(worst[1] <= 3, "10.9 itself varies by no more than three levels between these draws");
+        check(worst[0] <= (worst[1] > 1 ? worst[1] : 1), "rows of a matched image matched draw by draw land what all of them matched do");
+    }
+
+    // An image of an sRGB IOSurface context, its pixels written by the CPU, drawn into an Adobe RGB surface and
+    // then into an sRGB one, lands its own colour in the second; and a draw of it is kept when its own context
+    // is filled over right after.
+    {
+        CGColorSpaceRef adobe = CGColorSpaceCreateWithName(kCGColorSpaceAdobeRGB1998);
+        IOSurfaceRef source = createSurface(512, 512);
+        IOSurfaceLock(source, 0, NULL);
+        for (size_t y = 0; y < 512; y++) {
+            for (size_t x = 0; x < 512; x++) {
+                unsigned char *q = (unsigned char *)IOSurfaceGetBaseAddress(source) + y * IOSurfaceGetBytesPerRow(source) + x * 4;
+                q[0] = 35;
+                q[1] = 51;
+                q[2] = 234;
+                q[3] = 255;
+            }
+        }
+        IOSurfaceUnlock(source, 0, NULL);
+        CGContextRef sourceContext = CGIOSurfaceContextCreate(source, 512, 512, 8, 32, sRGB, kBGRA);
+        CGImageRef snapshot = CGIOSurfaceContextCreateImage(sourceContext);
+        IOSurfaceRef other = createSurface(4, 4), same = createSurface(4, 4);
+        CGContextRef otherContext = CGIOSurfaceContextCreate(other, 4, 4, 8, 32, adobe, kBGRA);
+        CGContextRef sameContext = CGIOSurfaceContextCreate(same, 4, 4, 8, 32, sRGB, kBGRA);
+        CGContextDrawImage(otherContext, CGRectMake(0, 0, 4, 4), snapshot);
+        CGContextFlush(otherContext);
+        CGContextDrawImage(sameContext, CGRectMake(0, 0, 4, 4), snapshot);
+        CGContextSetRGBFillColor(sourceContext, 0, 0, 1, 1);
+        CGContextFillRect(sourceContext, CGRectMake(0, 0, 512, 512));
+        CGContextFlush(sourceContext);
+        CGContextFlush(sameContext);
+        IOSurfaceLock(same, kIOSurfaceLockReadOnly, NULL);
+        const unsigned char *p = IOSurfaceGetBaseAddress(same);
+        printf("    sRGB surface after the Adobe RGB draw: BGRA %d,%d,%d,%d\n", p[0], p[1], p[2], p[3]);
+        check(abs(p[2] - 234) <= 1 && abs(p[1] - 51) <= 1 && abs(p[0] - 35) <= 1,
+            "an image of an IOSurface context lands its own colour in its own space after another space");
+        IOSurfaceUnlock(same, kIOSurfaceLockReadOnly, NULL);
+        CGImageRelease(snapshot);
+        CGContextRelease(sameContext);
+        CGContextRelease(otherContext);
+        CGContextRelease(sourceContext);
+        CFRelease(same);
+        CFRelease(other);
+        CFRelease(source);
+        CGColorSpaceRelease(adobe);
+    }
+
+    // An image of a linear-sRGB IOSurface context holding a ramp 3000 rows tall, drawn at its own size into an
+    // sRGB surface showing rows 2000 to 2099 only: every row lands within one level of its exact encoding.
+    {
+        enum { kWide = 64, kTall = 3000, kFirst = 2000, kRows = 100 };
+        IOSurfaceRef source = createSurface(kWide, kTall);
+        IOSurfaceLock(source, 0, NULL);
+        unsigned char *pixels = IOSurfaceGetBaseAddress(source);
+        for (size_t y = 0; y < kTall; y++) {
+            for (size_t x = 0; x < kWide; x++) {
+                unsigned char *p = pixels + y * IOSurfaceGetBytesPerRow(source) + x * 4;
+                p[0] = p[1] = p[2] = (unsigned char)(y % 256);
+                p[3] = 0xff;
+            }
+        }
+        IOSurfaceUnlock(source, 0, NULL);
+        CGContextRef sourceContext = CGIOSurfaceContextCreate(source, kWide, kTall, 8, 32, linear, kBGRA);
+        CGImageRef image = CGIOSurfaceContextCreateImage(sourceContext);
+        IOSurfaceRef surface = createSurface(kWide, kRows);
+        CGContextRef context = CGIOSurfaceContextCreate(surface, kWide, kRows, 8, 32, sRGB, kBGRA);
+        CGContextClearRect(context, CGRectMake(0, 0, kWide, kRows));
+        CGContextDrawImage(context, CGRectMake(0, kRows + kFirst - kTall, kWide, kTall), image);
+        CGContextFlush(context);
+        int worst = 0;
+        IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+        const unsigned char *base = IOSurfaceGetBaseAddress(surface);
+        for (size_t r = 0; r < kRows; r++) {
+            for (size_t x = 0; x < kWide; x++) {
+                int error = abs((int)base[r * IOSurfaceGetBytesPerRow(surface) + x * 4 + 1] - exactEncoding(((kFirst + r) % 256) / 255.0));
+                if (error > worst)
+                    worst = error;
+            }
+        }
+        IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+        printf("    image of an IOSurface context, rows drawn: worst level error %d\n", worst);
+        check(worst <= 1, "an image of an IOSurface context drawn in part matches the rows drawn");
+        check(objc_getAssociatedObject((id)image, sel_registerName("wk_ioSurfaceImageRows")) != NULL, "and has its rows matched");
+        CGImageRelease(image);
+        CGContextRelease(context);
+        CGContextRelease(sourceContext);
+        CFRelease(surface);
+        CFRelease(source);
+    }
+
+    // An image of an sRGB IOSurface context holding a vertical gradient, drawn into two bands of an Adobe RGB
+    // surface with its context filled over and flushed between them: both bands land 10.9's own bitmap-route
+    // match of the gradient, within one level.
+    {
+        enum { kWide = 32, kTall = 2048, kShown = 256 };
+        CGColorSpaceRef adobe = CGColorSpaceCreateWithName(kCGColorSpaceAdobeRGB1998);
+        IOSurfaceRef source = createSurface(kWide, kTall);
+        unsigned char *gradient = malloc(kWide * kTall * 4);
+        for (size_t y = 0; y < kTall; y++) {
+            for (size_t x = 0; x < kWide; x++) {
+                unsigned char *p = gradient + (y * kWide + x) * 4;
+                p[0] = (unsigned char)(255 - y % 256);
+                p[1] = (unsigned char)(y * 7 % 256);
+                p[2] = (unsigned char)(y % 256);
+                p[3] = 0xff;
+            }
+        }
+        IOSurfaceLock(source, 0, NULL);
+        for (size_t y = 0; y < kTall; y++)
+            memcpy((unsigned char *)IOSurfaceGetBaseAddress(source) + y * IOSurfaceGetBytesPerRow(source), gradient + y * kWide * 4, kWide * 4);
+        IOSurfaceUnlock(source, 0, NULL);
+        CGContextRef sourceContext = CGIOSurfaceContextCreate(source, kWide, kTall, 8, 32, sRGB, kBGRA);
+        CGImageRef snapshot = CGIOSurfaceContextCreateImage(sourceContext);
+
+        // Image rows 1000 to 1255 lie along the destination; its bottom band shows 1128 to 1255, its top 1000 to 1127.
+        CGRect rect = CGRectMake(0, kShown + 1000 - kTall, kWide, kTall);
+        IOSurfaceRef surface = createSurface(kWide, kShown);
+        CGContextRef context = CGIOSurfaceContextCreate(surface, kWide, kShown, 8, 32, adobe, kBGRA);
+        CGContextClearRect(context, CGRectMake(0, 0, kWide, kShown));
+        CFArrayRef record = (CFArrayRef)(void *)objc_getAssociatedObject((id)snapshot, sel_registerName("wk_imageSurface"));
+        uint32_t recordedSeed = 0;
+        if (record)
+            CFNumberGetValue((CFNumberRef)CFArrayGetValueAtIndex(record, 1), kCFNumberSInt32Type, &recordedSeed);
+        check(record && IOSurfaceGetSeed(source) == recordedSeed, "an image of an IOSurface context keeps its surface's seed, unchanged before a redraw");
+        CGContextSaveGState(context);
+        CGContextClipToRect(context, CGRectMake(0, 0, kWide, kShown / 2));
+        CGContextDrawImage(context, rect, snapshot);
+        CGContextRestoreGState(context);
+        CGContextFlush(context);
+        CGContextSetRGBFillColor(sourceContext, 0, 0, 1, 1);
+        CGContextFillRect(sourceContext, CGRectMake(0, 0, kWide, kTall));
+        CGContextFlush(sourceContext);
+        check(IOSurfaceGetSeed(source) != recordedSeed, "and changed after one");
+        CGContextSaveGState(context);
+        CGContextClipToRect(context, CGRectMake(0, kShown / 2, kWide, kShown / 2));
+        CGContextDrawImage(context, rect, snapshot);
+        CGContextRestoreGState(context);
+        CGContextFlush(context);
+
+        CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, gradient, kWide * kTall * 4, NULL);
+        CGImageRef memoryImage = CGImageCreate(kWide, kTall, 8, 32, kWide * 4, sRGB, kBGRA, provider, NULL, true, kCGRenderingIntentDefault);
+        CGDataProviderRelease(provider);
+        unsigned char *expected = calloc(kShown, kWide * 4);
+        CGContextRef bitmap = CGBitmapContextCreate(expected, kWide, kShown, 8, kWide * 4, adobe, kBGRA);
+        system(bitmap, rect, memoryImage);
+        int worst = 0;
+        IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+        const unsigned char *base = IOSurfaceGetBaseAddress(surface);
+        for (size_t r = 0; r < kShown; r++) {
+            for (size_t i = 0; i < kWide * 4; i++) {
+                int difference = abs((int)base[r * IOSurfaceGetBytesPerRow(surface) + i] - (int)expected[r * kWide * 4 + i]);
+                if (difference > worst)
+                    worst = difference;
+            }
+        }
+        IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+        printf("    image of an IOSurface context in two bands around a refill: worst level difference %d\n", worst);
+        check(worst <= 1, "an image of an IOSurface context keeps its pixels for draws after its context is drawn into");
+        CGContextRelease(bitmap);
+        free(expected);
+        CGImageRelease(memoryImage);
+        CGImageRelease(snapshot);
+        CGContextRelease(context);
+        CGContextRelease(sourceContext);
+        CFRelease(surface);
+        CFRelease(source);
+        free(gradient);
+        CGColorSpaceRelease(adobe);
+    }
+
+    // An sRGB image of an IOSurface context 20000 rows tall, its pixels written by the CPU, drawn into an Adobe
+    // RGB surface and then into an sRGB one, lands its own colour in the second.
+    {
+        enum { kWide = 8, kTall = 20000 };
+        CGColorSpaceRef adobe = CGColorSpaceCreateWithName(kCGColorSpaceAdobeRGB1998);
+        IOSurfaceRef source = createSurface(kWide, kTall);
+        IOSurfaceLock(source, 0, NULL);
+        for (size_t y = 0; y < kTall; y++) {
+            for (size_t x = 0; x < kWide; x++) {
+                unsigned char *q = (unsigned char *)IOSurfaceGetBaseAddress(source) + y * IOSurfaceGetBytesPerRow(source) + x * 4;
+                q[0] = 35;
+                q[1] = 51;
+                q[2] = 234;
+                q[3] = 255;
+            }
+        }
+        IOSurfaceUnlock(source, 0, NULL);
+        CGContextRef sourceContext = CGIOSurfaceContextCreate(source, kWide, kTall, 8, 32, sRGB, kBGRA);
+        CGImageRef snapshot = CGIOSurfaceContextCreateImage(sourceContext);
+        IOSurfaceRef other = createSurface(kWide, 4), same = createSurface(kWide, 4);
+        CGContextRef otherContext = CGIOSurfaceContextCreate(other, kWide, 4, 8, 32, adobe, kBGRA);
+        CGContextRef sameContext = CGIOSurfaceContextCreate(same, kWide, 4, 8, 32, sRGB, kBGRA);
+        CGContextDrawImage(otherContext, CGRectMake(0, 4 - kTall, kWide, kTall), snapshot);
+        CGContextFlush(otherContext);
+        CGContextDrawImage(sameContext, CGRectMake(0, 4 - kTall, kWide, kTall), snapshot);
+        CGContextFlush(sameContext);
+        IOSurfaceLock(same, kIOSurfaceLockReadOnly, NULL);
+        const unsigned char *p = IOSurfaceGetBaseAddress(same);
+        printf("    20000-row image, sRGB surface after the Adobe RGB draw: BGRA %d,%d,%d,%d\n", p[0], p[1], p[2], p[3]);
+        check(abs(p[2] - 234) <= 1 && abs(p[1] - 51) <= 1 && abs(p[0] - 35) <= 1, "and does so 20000 rows tall");
+        IOSurfaceUnlock(same, kIOSurfaceLockReadOnly, NULL);
+        CGImageRelease(snapshot);
+        CGContextRelease(sameContext);
+        CGContextRelease(otherContext);
+        CGContextRelease(sourceContext);
+        CFRelease(same);
+        CFRelease(other);
+        CFRelease(source);
+        CGColorSpaceRelease(adobe);
+    }
+
+    // A linear-sRGB ramp 20000 rows tall, over the software renderer's texture limit, drawn at its own size with
+    // only rows 15000 to 15099 inside the surface: every row lands within one level of its exact encoding.
+    {
+        enum { kWide = 4, kTall = 20000, kFirst = 15000, kRows = 100 };
+        unsigned char *pixels = malloc(kWide * kTall * 4);
+        for (size_t y = 0; y < kTall; y++) {
+            for (size_t x = 0; x < kWide; x++) {
+                unsigned char *p = pixels + (y * kWide + x) * 4;
+                p[0] = p[1] = p[2] = (unsigned char)(y % 256);
+                p[3] = 0xff;
+            }
+        }
+        CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, pixels, kWide * kTall * 4, NULL);
+        CGImageRef image = CGImageCreate(kWide, kTall, 8, 32, kWide * 4, linear, kBGRA, provider, NULL, true, kCGRenderingIntentDefault);
+        CGDataProviderRelease(provider);
+        IOSurfaceRef surface = createSurface(kWide, kRows);
+        CGContextRef context = CGIOSurfaceContextCreate(surface, kWide, kRows, 8, 32, sRGB, kBGRA);
+        CGContextClearRect(context, CGRectMake(0, 0, kWide, kRows));
+        // Image row kFirst + r lies along surface row r counted from the top.
+        CGContextDrawImage(context, CGRectMake(0, kRows + kFirst - kTall, kWide, kTall), image);
+        CGContextFlush(context);
+        int worst = 0;
+        IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+        const unsigned char *base = IOSurfaceGetBaseAddress(surface);
+        for (size_t r = 0; r < kRows; r++) {
+            int error = abs((int)base[r * IOSurfaceGetBytesPerRow(surface) + 1] - exactEncoding(((kFirst + r) % 256) / 255.0));
+            if (error > worst)
+                worst = error;
+        }
+        IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+        printf("    tall image, rows drawn: worst level error %d\n", worst);
+        check(worst <= 1, "an image taller than the texture limit drawn in part matches the rows drawn");
+        CGContextRelease(context);
+        CFRelease(surface);
+        CGImageRelease(image);
+        free(pixels);
     }
 
     // Straight alpha: every colour level c at every alpha a, matched within one level of exact.

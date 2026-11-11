@@ -165,6 +165,7 @@ WK_SYSTEM_FN("IOSurface", kern_return_t, IOSurfaceUnlock, (IOSurfaceRef, uint32_
 WK_SYSTEM_FN("IOSurface", void *, IOSurfaceGetBaseAddress, (IOSurfaceRef));
 WK_SYSTEM_FN("IOSurface", size_t, IOSurfaceGetAllocSize, (IOSurfaceRef));
 WK_SYSTEM_FN("IOSurface", size_t, IOSurfaceGetBytesPerRow, (IOSurfaceRef));
+WK_SYSTEM_FN("IOSurface", uint32_t, IOSurfaceGetSeed, (IOSurfaceRef));
 
 extern IOSurfaceRef CGIOSurfaceContextGetSurface(CGContextRef);
 extern CGColorSpaceRef CGIOSurfaceContextGetColorSpace(CGContextRef);
@@ -2240,13 +2241,17 @@ static int wk_transparencyLayerOpenCount;
 // whatever its own colour space is: an sRGB image drawn into a Display P3 surface and then into an
 // sRGB one reads 234,51,35 in both. It also matches all but small images through its renderer's colour
 // cube, interpolating between nodes eight 8-bit levels apart, which puts level 1 of a linear-sRGB image
-// at sRGB 6 where ColorSync answers 13. An IOSurface draw is therefore always made through an image
-// kept for that destination colour space and released with the image. An image in another colour space
-// is matched into that space by CoreGraphics' bitmap route, which QuartzCore then draws unmatched; an
-// image already in it is a CGImageCreateCopy, which shares its pixels and has a cache entry of its own
-// that no other caller can fill. 10.9 caches both a CGIOSurfaceContextCreateImage image and a
-// direct-provider image on these routes; the per-space image is what gives each destination space its
-// own matching. An image over the renderer's texture limit (below) is drawn in parts of its per-space image.
+// at sRGB 6 where ColorSync answers 13. An IOSurface draw is therefore always made through an image in
+// the destination colour space: an IOSurface kept with the image, into which the rows each draw reads are
+// matched (wk_copyImageWithRowsMatched), or, for any other image, an image kept for that space and released
+// with the image. An image in another colour space is matched into that space by CoreGraphics' bitmap route,
+// which QuartzCore then draws unmatched; an image already in it is a CGImageCreateCopy, which shares its
+// pixels and has a cache entry of its own that no other caller can fill. 10.9 caches both a copy of a
+// CGIOSurfaceContextCreateImage image and a direct-provider image on these routes; the per-space image is
+// what gives each destination space its own matching. An image of an IOSurface context already in the
+// space is drawn as it is: QuartzCore draws such an image from its surface, or from the copy it detaches,
+// unmatched and outside that cache. An image over the renderer's texture limit (below) is drawn in parts of
+// the image drawn for its space.
 //
 // Every image in the process carries its own copy of this archive, so the association key is a
 // selector and the lock is one object the runtime's association table holds for the whole process.
@@ -2281,15 +2286,21 @@ static id wk_ioSurfaceImageLock(void)
     return lock;
 }
 
-// The bytes of an unmasked image whose pixels are 8-bit premultiplied RGB in 32 bits, as its provider holds
-// them, or NULL for any other image, which is read through a bitmap.
-static CFDataRef wk_copyPremultipliedPixels(CGImageRef image)
+// Whether an image is unmasked, its pixels 8-bit premultiplied RGB in 32 bits.
+static bool wk_hasPremultipliedPixels(CGImageRef image)
 {
     CGImageAlphaInfo alpha = CGImageGetAlphaInfo(image);
     CGBitmapInfo order = CGImageGetBitmapInfo(image) & kCGBitmapByteOrderMask;
-    if (CGImageGetBitsPerComponent(image) != 8 || CGImageGetBitsPerPixel(image) != 32 || CGImageGetDecode(image) || CGImageGetMask(image)
-        || (alpha != kCGImageAlphaPremultipliedFirst && alpha != kCGImageAlphaPremultipliedLast)
-        || (order != kCGBitmapByteOrderDefault && order != kCGBitmapByteOrder32Big && order != kCGBitmapByteOrder32Little))
+    return CGImageGetBitsPerComponent(image) == 8 && CGImageGetBitsPerPixel(image) == 32 && !CGImageGetDecode(image) && !CGImageGetMask(image)
+        && (alpha == kCGImageAlphaPremultipliedFirst || alpha == kCGImageAlphaPremultipliedLast)
+        && (order == kCGBitmapByteOrderDefault || order == kCGBitmapByteOrder32Big || order == kCGBitmapByteOrder32Little);
+}
+
+// The bytes of an image wk_hasPremultipliedPixels accepts, as its provider holds them, or NULL for any other
+// image, which is read through a bitmap.
+static CFDataRef wk_copyPremultipliedPixels(CGImageRef image)
+{
+    if (!wk_hasPremultipliedPixels(image))
         return NULL;
     CFDataRef data = CGDataProviderCopyData(CGImageGetDataProvider(image));
     if (data && (size_t)CFDataGetLength(data) < CGImageGetBytesPerRow(image) * (CGImageGetHeight(image) - 1) + CGImageGetWidth(image) * 4) {
@@ -2499,6 +2510,8 @@ size_t wk_coreAnimationTextureLimit(void)
 }
 
 static bool wk_drawOversizedImageInIOSurface(CGContextRef, CGRect, CGImageRef);
+static CGImageRef wk_copyImageForDraw(CGContextRef, CGRect, CGImageRef, CGColorSpaceRef);
+static const void *wk_imageSurfaceKey(void);
 
 // Direct IOSurface contexts and asynchronous CA layer contexts share this renderer delegate.
 extern CGContextRef CGIOSurfaceContextCreate(IOSurfaceRef, size_t, size_t, size_t, size_t, CGColorSpaceRef, CGBitmapInfo);
@@ -2506,6 +2519,7 @@ WK_SYSTEM_FN("IOSurface", IOSurfaceRef, IOSurfaceCreate, (CFDictionaryRef));
 WK_SYSTEM_CONST("IOSurface", CFStringRef, kIOSurfaceWidth);
 WK_SYSTEM_CONST("IOSurface", CFStringRef, kIOSurfaceHeight);
 WK_SYSTEM_CONST("IOSurface", CFStringRef, kIOSurfaceBytesPerElement);
+WK_SYSTEM_CONST("IOSurface", CFStringRef, kIOSurfacePixelFormat);
 static const void *wk_coreAnimationIOSurfaceDelegateVTable;
 
 static const void *wk_contextDelegateVTable(CGContextRef context)
@@ -2589,10 +2603,11 @@ WK_POLYFILL_REPLACES("CoreGraphics", void, CGContextDrawImage, (CGContextRef con
     CGColorSpaceRef bitmapSpace = NULL;
     if (context && image && wk_drawsThroughCoreAnimationIOSurface(context)) {
         CGColorSpaceRef colorSpace = CGContextGetColorSpace(context);
-        CGImageRef copy = colorSpace ? wk_imageForDestinationColorSpace(image, colorSpace) : NULL;
-        CGImageRef drawn = copy ? copy : image;
-        if (!wk_drawOversizedImageInIOSurface(context, rect, drawn))
+        CGImageRef drawn = colorSpace ? wk_copyImageForDraw(context, rect, image, colorSpace) : CGImageRetain(image);
+        if (drawn && !wk_drawOversizedImageInIOSurface(context, rect, drawn))
             WK_ORIGINAL(CGContextDrawImage)(context, rect, drawn);
+        if (drawn)
+            CGImageRelease(drawn);
     } else if (context && image && wk_matchesBitmapDraw(context, image, &bitmapSpace)) {
         CGImageRef copy = wk_imageForDestinationColorSpace(image, bitmapSpace);
         WK_ORIGINAL(CGContextDrawImage)(context, rect, copy ? copy : image);
@@ -2653,6 +2668,50 @@ static void wk_drawImagePart(CGContextRef context, CGRect rect, CGImageRef image
     CGImageRelease(part);
 }
 
+// The part of `rect` whose drawing can reach the clip, or an empty rect. A style -- a shadow, a focus ring --
+// paints around what it is drawn with, so the part that matters is the one whose styled output meets the
+// clip. CGStyleGetDrawBoundingBox outsets a base-space rect by the style's reach, the same distance on every
+// side, which is also the farthest a source pixel outside the clip can paint into it.
+static CGRect wk_visiblePartOfDraw(CGContextRef context, CGRect rect)
+{
+    CGAffineTransform ctm = CGContextGetCTM(context);
+    CGRect clip = CGContextGetClipBoundingBox(context);
+    CGStyleRef style = CGContextGetStyle(context);
+    if (style) {
+        CGRect reach = CGStyleGetDrawBoundingBox(style, CGRectApplyAffineTransform(clip, ctm));
+        if (!CGRectIsNull(reach) && !CGRectIsInfinite(reach))
+            clip = CGRectApplyAffineTransform(reach, CGAffineTransformInvert(ctm));
+    }
+    CGRect visible = CGRectIntersection(rect, clip);
+    return CGRectIsNull(visible) || CGRectIsEmpty(visible) ? CGRectZero : visible;
+}
+
+// Destination pixels an image pixel spans, at most 1: how far the draw shrinks the image.
+static double wk_devicePixelsPerImagePixel(CGContextRef context, CGRect rect, CGImageRef image)
+{
+    CGAffineTransform ctm = CGContextGetCTM(context);
+    double pixelsPerUnitX = CGImageGetWidth(image) / rect.size.width, pixelsPerUnitY = CGImageGetHeight(image) / rect.size.height;
+    return fmin(fmin(hypot(ctm.a, ctm.b) / pixelsPerUnitX, hypot(ctm.c, ctm.d) / pixelsPerUnitY), 1);
+}
+
+// The source pixels a filter reads beyond a part's edge: a couple, widened by how far the draw shrinks.
+static double wk_filterMarginForDraw(CGContextRef context, CGRect rect, CGImageRef image)
+{
+    return ceil(2 / wk_devicePixelsPerImagePixel(context, rect, image)) + 2;
+}
+
+// The image pixels, as left, top, right and bottom, under `visible` in a draw of `image` into `rect`, widened
+// by `margin` on every side and kept within the image.
+static void wk_imagePixelsUnder(CGRect rect, CGImageRef image, CGRect visible, double margin, double part[4])
+{
+    size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+    double pixelsPerUnitX = width / rect.size.width, pixelsPerUnitY = height / rect.size.height;
+    part[0] = fmax(floor((CGRectGetMinX(visible) - CGRectGetMinX(rect)) * pixelsPerUnitX) - margin, 0);
+    part[1] = fmax(floor((CGRectGetMaxY(rect) - CGRectGetMaxY(visible)) * pixelsPerUnitY) - margin, 0);
+    part[2] = fmin(ceil((CGRectGetMaxX(visible) - CGRectGetMinX(rect)) * pixelsPerUnitX) + margin, width);
+    part[3] = fmin(ceil((CGRectGetMaxY(rect) - CGRectGetMinY(visible)) * pixelsPerUnitY) + margin, height);
+}
+
 // Answers whether the draw was made here; false leaves it to 10.9, which draws an image within the limit.
 static bool wk_drawOversizedImageInIOSurface(CGContextRef context, CGRect rect, CGImageRef image)
 {
@@ -2663,33 +2722,18 @@ static bool wk_drawOversizedImageInIOSurface(CGContextRef context, CGRect rect, 
     if (CGImageIsMask(image) || !(rect.size.width > 0) || !(rect.size.height > 0))
         return false;
 
-    // A style -- a shadow, a focus ring -- paints around what it is drawn with, so the part that matters is
-    // the one whose styled output meets the clip. CGStyleGetDrawBoundingBox outsets a base-space rect by the
-    // style's reach, the same distance on every side, which is also the farthest a source pixel outside the
-    // clip can paint into it.
-    CGAffineTransform ctm = CGContextGetCTM(context);
-    CGRect clip = CGContextGetClipBoundingBox(context);
-    CGStyleRef style = CGContextGetStyle(context);
-    if (style) {
-        CGRect reach = CGStyleGetDrawBoundingBox(style, CGRectApplyAffineTransform(clip, ctm));
-        if (!CGRectIsNull(reach) && !CGRectIsInfinite(reach))
-            clip = CGRectApplyAffineTransform(reach, CGAffineTransformInvert(ctm));
-    }
-    CGRect visible = CGRectIntersection(rect, clip);
-    if (CGRectIsNull(visible) || CGRectIsEmpty(visible))
+    CGRect visible = wk_visiblePartOfDraw(context, rect);
+    if (CGRectIsEmpty(visible))
         return true;
 
-    // The source pixels a filter reads beyond a part's edge: a couple, widened by how far the draw shrinks. A
-    // tile's core still has to cover a destination pixel, which bounds the margin on either side of it.
+    // A tile's core still has to cover a destination pixel, which bounds the filter margin on either side of it.
     double pixelsPerUnitX = width / rect.size.width, pixelsPerUnitY = height / rect.size.height;
-    double devicePerPixel = fmin(hypot(ctm.a, ctm.b) / pixelsPerUnitX, hypot(ctm.c, ctm.d) / pixelsPerUnitY);
-    double pixelsPerDevicePixel = ceil(1 / fmin(devicePerPixel, 1));
-    double margin = fmax(fmin(ceil(2 / fmin(devicePerPixel, 1)) + 2, floor((limit - pixelsPerDevicePixel) / 2)), 0);
+    double pixelsPerDevicePixel = ceil(1 / wk_devicePixelsPerImagePixel(context, rect, image));
+    double margin = fmax(fmin(wk_filterMarginForDraw(context, rect, image), floor((limit - pixelsPerDevicePixel) / 2)), 0);
 
-    double left = fmax(floor((CGRectGetMinX(visible) - CGRectGetMinX(rect)) * pixelsPerUnitX) - margin, 0);
-    double right = fmin(ceil((CGRectGetMaxX(visible) - CGRectGetMinX(rect)) * pixelsPerUnitX) + margin, width);
-    double top = fmax(floor((CGRectGetMaxY(rect) - CGRectGetMaxY(visible)) * pixelsPerUnitY) - margin, 0);
-    double bottom = fmin(ceil((CGRectGetMaxY(rect) - CGRectGetMinY(visible)) * pixelsPerUnitY) + margin, height);
+    double part[4];
+    wk_imagePixelsUnder(rect, image, visible, margin, part);
+    double left = part[0], top = part[1], right = part[2], bottom = part[3];
     if (right <= left || bottom <= top)
         return true;
     if (right - left <= limit && bottom - top <= limit) {
@@ -2723,6 +2767,260 @@ static bool wk_drawOversizedImageInIOSurface(CGContextRef context, CGRect rect, 
     }
     CGContextEndTransparencyLayer(context);
     return true;
+}
+
+// An 8-bit premultiplied RGB image with a parametric match into an IOSurface context's colour space is matched
+// a row at a time into an IOSurface of the image's size kept for that space. Each draw matches the rows it
+// reads that are still unmatched -- the clip's share, widened by the margin its filter reads -- and draws a new
+// image of the surface at the image's own rect. A canvas, whose every change is a new image, matches the rows
+// of the tiles that repaint.
+static const void *wk_ioSurfaceImageRowsKey(void)
+{
+    static const void *key;
+    if (!key)
+        key = (const void *)sel_registerName("wk_ioSurfaceImageRows");
+    return key;
+}
+
+// The surface of an image of an IOSurface context and the surface's seed when the image was made, as a
+// two-element array.
+static const void *wk_imageSurfaceKey(void)
+{
+    static const void *key;
+    if (!key)
+        key = (const void *)sel_registerName("wk_imageSurface");
+    return key;
+}
+
+// CGIOSurfaceContextCreateImage — a DELIBERATE REPLACEMENT of a present 10.9 function. Its image keeps its
+// context's surface and that surface's seed, from which the rows a draw reads are taken while the seed is
+// unchanged.
+WK_POLYFILL_REPLACES("CoreGraphics", CGImageRef, CGIOSurfaceContextCreateImage, (CGContextRef context))
+{
+    CGImageRef image = WK_ORIGINAL(CGIOSurfaceContextCreateImage)(context);
+    IOSurfaceRef surface = image ? CGIOSurfaceContextGetSurface(context) : NULL;
+    if (surface) {
+        uint32_t seed = WK_SYSTEM(IOSurfaceGetSeed)(surface);
+        CFNumberRef seedNumber = CFNumberCreate(NULL, kCFNumberSInt32Type, &seed);
+        const void *values[] = { surface, seedNumber };
+        CFArrayRef record = CFArrayCreate(NULL, values, 2, &kCFTypeArrayCallBacks);
+        objc_setAssociatedObject((id)image, wk_imageSurfaceKey(), (id)(void *)record, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        CFRelease(record);
+        CFRelease(seedNumber);
+    }
+    return image;
+}
+
+// The (colour space, surface, context, matched-row flags) entry of `rows`, a flat array, for `colorSpace`.
+static CFIndex wk_findRowsForColorSpace(CFArrayRef rows, CGColorSpaceRef colorSpace)
+{
+    CFIndex count = rows ? CFArrayGetCount(rows) : 0;
+    for (CFIndex index = 0; index + 3 < count; index += 4) {
+        if (WK_SYSTEM(CGColorSpaceEqualToColorSpace)((CGColorSpaceRef)CFArrayGetValueAtIndex(rows, index), colorSpace))
+            return index;
+    }
+    return kCFNotFound;
+}
+
+static IOSurfaceRef wk_createBGRASurface(size_t width, size_t height)
+{
+    int surfaceWidth = (int)width, surfaceHeight = (int)height, pixelBytes = 4, pixelFormat = ('B' << 24) | ('G' << 16) | ('R' << 8) | 'A';
+    CFNumberRef widthNumber = CFNumberCreate(NULL, kCFNumberIntType, &surfaceWidth);
+    CFNumberRef heightNumber = CFNumberCreate(NULL, kCFNumberIntType, &surfaceHeight);
+    CFNumberRef bytesNumber = CFNumberCreate(NULL, kCFNumberIntType, &pixelBytes);
+    CFNumberRef formatNumber = CFNumberCreate(NULL, kCFNumberIntType, &pixelFormat);
+    const void *keys[] = { WK_SYSTEM(kIOSurfaceWidth), WK_SYSTEM(kIOSurfaceHeight), WK_SYSTEM(kIOSurfaceBytesPerElement), WK_SYSTEM(kIOSurfacePixelFormat) };
+    const void *values[] = { widthNumber, heightNumber, bytesNumber, formatNumber };
+    CFDictionaryRef properties = CFDictionaryCreate(NULL, keys, values, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    IOSurfaceRef surface = WK_SYSTEM(IOSurfaceCreate)(properties);
+    CFRelease(properties);
+    CFRelease(formatNumber);
+    CFRelease(bytesNumber);
+    CFRelease(heightNumber);
+    CFRelease(widthNumber);
+    return surface;
+}
+
+static const CGBitmapInfo wk_bgraInfo = kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaPremultipliedFirst;
+
+// Under the accelerated renderer, rows of an image of an IOSurface context whose surface is unchanged are copied
+// by that renderer, exactly, into a surface of their own and matched from there.
+static bool wk_matchRowsCopiedOnGPU(CGImageRef image, const wk_rgb_match *match, uint8_t *out, size_t stride, size_t top, size_t rows)
+{
+    size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+    IOSurfaceRef band = wk_createBGRASurface(width, rows);
+    CGContextRef context = band ? CGIOSurfaceContextCreate(band, width, rows, 8, 32, CGImageGetColorSpace(image), wk_bgraInfo) : NULL;
+    bool matched = false;
+    if (context) {
+        CGContextSetBlendMode(context, kCGBlendModeCopy);
+        CGContextSetInterpolationQuality(context, kCGInterpolationNone);
+        WK_ORIGINAL(CGContextDrawImage)(context, CGRectMake(0, (CGFloat)rows + top - height, width, height), image);
+        CGContextFlush(context);
+        if (!WK_SYSTEM(IOSurfaceLock)(band, kIOSurfaceLockReadOnly, NULL)) {
+            static const int bgraOffsets[4] = { 2, 1, 0, 3 };
+            wk_matchNarrowRows(match, (const uint8_t *)WK_SYSTEM(IOSurfaceGetBaseAddress)(band), WK_SYSTEM(IOSurfaceGetBytesPerRow)(band),
+                bgraOffsets, out, stride, width, rows);
+            WK_SYSTEM(IOSurfaceUnlock)(band, kIOSurfaceLockReadOnly, NULL);
+            matched = true;
+        }
+        CGContextRelease(context);
+    }
+    if (band)
+        CFRelease(band);
+    return matched;
+}
+
+static bool wk_matchRowsIntoSurface(CGImageRef image, const wk_rgb_match *match, IOSurfaceRef surface, size_t top, size_t bottom)
+{
+    size_t width = CGImageGetWidth(image), rows = bottom - top;
+    if (WK_SYSTEM(IOSurfaceLock)(surface, 0, NULL))
+        return false;
+    size_t stride = WK_SYSTEM(IOSurfaceGetBytesPerRow)(surface);
+    uint8_t *out = (uint8_t *)WK_SYSTEM(IOSurfaceGetBaseAddress)(surface) + top * stride;
+    int offsets[4];
+    wk_premultipliedOffsets(image, offsets);
+    bool matched = false;
+    CFArrayRef record = (CFArrayRef)(void *)objc_getAssociatedObject((id)image, wk_imageSurfaceKey());
+    IOSurfaceRef source = record ? (IOSurfaceRef)CFArrayGetValueAtIndex(record, 0) : NULL;
+    uint32_t seed = 0;
+    if (record)
+        CFNumberGetValue((CFNumberRef)CFArrayGetValueAtIndex(record, 1), kCFNumberSInt32Type, &seed);
+    if (source && wk_hasAcceleratedCoreAnimationRenderer() && CGImageGetBitmapInfo(image) == wk_bgraInfo
+        && WK_SYSTEM(IOSurfaceGetSeed)(source) == seed)
+        matched = wk_matchRowsCopiedOnGPU(image, match, out, stride, top, rows);
+    else {
+        if (source && WK_SYSTEM(IOSurfaceGetBytesPerRow)(source) == CGImageGetBytesPerRow(image)
+            && !WK_SYSTEM(IOSurfaceLock)(source, kIOSurfaceLockReadOnly, NULL)) {
+            if (WK_SYSTEM(IOSurfaceGetSeed)(source) == seed) {
+                const uint8_t *in = (const uint8_t *)WK_SYSTEM(IOSurfaceGetBaseAddress)(source) + top * CGImageGetBytesPerRow(image);
+                wk_matchNarrowRows(match, in, CGImageGetBytesPerRow(image), offsets, out, stride, width, rows);
+                matched = true;
+            }
+            WK_SYSTEM(IOSurfaceUnlock)(source, kIOSurfaceLockReadOnly, NULL);
+        }
+        if (!matched) {
+            CGImageRef band = CGImageCreateWithImageInRect(image, CGRectMake(0, top, width, rows));
+            CFDataRef pixels = band ? wk_copyPremultipliedPixels(band) : NULL;
+            if (pixels) {
+                wk_matchNarrowRows(match, CFDataGetBytePtr(pixels), CGImageGetBytesPerRow(band), offsets, out, stride, width, rows);
+                CFRelease(pixels);
+                matched = true;
+            }
+            if (band)
+                CGImageRelease(band);
+        }
+    }
+    WK_SYSTEM(IOSurfaceUnlock)(surface, 0, NULL);
+    return matched;
+}
+
+// An image of the surface kept for `colorSpace` once rows top to bottom are matched into it, or NULL for an
+// image this route does not take. An image of a surface always interpolates, so an image that does not is
+// matched whole, as is one over the renderer's texture limit.
+static CGImageRef wk_copyImageWithRowsMatched(CGImageRef image, CGColorSpaceRef colorSpace, size_t top, size_t bottom)
+{
+    CGColorSpaceRef imageSpace = CGImageGetColorSpace(image);
+    if (!imageSpace || CGImageIsMask(image) || CGImageGetMaskingColors(image) || !CGImageGetShouldInterpolate(image) || !wk_hasPremultipliedPixels(image)
+        || CGColorSpaceGetModel(imageSpace) != kCGColorSpaceModelRGB || CGColorSpaceGetModel(colorSpace) != kCGColorSpaceModelRGB
+        || WK_SYSTEM(CGColorSpaceEqualToColorSpace)(imageSpace, colorSpace))
+        return NULL;
+    size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image), limit = wk_coreAnimationTextureLimit();
+    if (!width || !height || width > INT_MAX || height > INT_MAX || (limit && (width > limit || height > limit)))
+        return NULL;
+    const wk_rgb_match *match = wk_rgbMatch(imageSpace, colorSpace, CGImageGetRenderingIntent(image));
+    if (!match)
+        return NULL;
+
+    id lock = wk_ioSurfaceImageLock();
+    objc_sync_enter(lock);
+    CFMutableArrayRef rows = (CFMutableArrayRef)(void *)objc_getAssociatedObject((id)image, wk_ioSurfaceImageRowsKey());
+    CFIndex entry = wk_findRowsForColorSpace(rows, colorSpace);
+    if (entry == kCFNotFound) {
+        IOSurfaceRef surface = wk_createBGRASurface(width, height);
+        CGContextRef context = surface ? CGIOSurfaceContextCreate(surface, width, height, 8, 32, colorSpace, wk_bgraInfo) : NULL;
+        CFMutableDataRef matchedRows = context ? CFDataCreateMutable(kCFAllocatorDefault, 0) : NULL;
+        if (matchedRows)
+            CFDataSetLength(matchedRows, (CFIndex)height);
+        if (!rows && matchedRows) {
+            rows = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+            if (rows) {
+                objc_setAssociatedObject((id)image, wk_ioSurfaceImageRowsKey(), (id)(void *)rows, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                CFRelease(rows);
+            }
+        }
+        if (rows && matchedRows) {
+            entry = CFArrayGetCount(rows);
+            CFArrayAppendValue(rows, colorSpace);
+            CFArrayAppendValue(rows, surface);
+            CFArrayAppendValue(rows, context);
+            CFArrayAppendValue(rows, matchedRows);
+        }
+        if (matchedRows)
+            CFRelease(matchedRows);
+        if (context)
+            CGContextRelease(context);
+        if (surface)
+            CFRelease(surface);
+    }
+    CGContextRef context = entry != kCFNotFound ? CGContextRetain((CGContextRef)CFArrayGetValueAtIndex(rows, entry + 2)) : NULL;
+    IOSurfaceRef surface = entry != kCFNotFound ? (IOSurfaceRef)CFArrayGetValueAtIndex(rows, entry + 1) : NULL;
+    CFMutableDataRef matchedRows = entry != kCFNotFound ? (CFMutableDataRef)CFRetain(CFArrayGetValueAtIndex(rows, entry + 3)) : NULL;
+    objc_sync_exit(lock);
+
+    // Rows are matched under the row flags' lock.
+    CGImageRef result = NULL;
+    if (matchedRows) {
+        objc_sync_enter((id)(void *)matchedRows);
+        uint8_t *matched = CFDataGetMutableBytePtr(matchedRows);
+        bool complete = true;
+        for (size_t row = top; complete && row < bottom;) {
+            if (matched[row]) {
+                row++;
+                continue;
+            }
+            size_t end = row;
+            while (end < bottom && !matched[end])
+                end++;
+            complete = wk_matchRowsIntoSurface(image, match, surface, row, end);
+            if (complete)
+                memset(matched + row, 1, end - row);
+            row = end;
+        }
+        if (complete)
+            result = WK_ORIGINAL(CGIOSurfaceContextCreateImage)(context);
+        objc_sync_exit((id)(void *)matchedRows);
+        CFRelease(matchedRows);
+        CGContextRelease(context);
+    }
+    wk_releaseRGBMatch(match);
+    return result;
+}
+
+// The image a draw of `image` into an IOSurface context of `colorSpace` makes, retained, or NULL when the draw
+// reaches no pixel: an image of an IOSurface context already in the space itself, an image of the space's
+// matched rows, or the image matched whole and kept.
+static CGImageRef wk_copyImageForDraw(CGContextRef context, CGRect rect, CGImageRef image, CGColorSpaceRef colorSpace)
+{
+    CGColorSpaceRef imageSpace = CGImageGetColorSpace(image);
+    if (imageSpace && WK_SYSTEM(CGColorSpaceEqualToColorSpace)(imageSpace, colorSpace) && objc_getAssociatedObject((id)image, wk_imageSurfaceKey()))
+        return CGImageRetain(image);
+    size_t top = 0, bottom = CGImageGetHeight(image);
+    if (rect.size.width > 0 && rect.size.height > 0) {
+        CGRect visible = wk_visiblePartOfDraw(context, rect);
+        if (CGRectIsEmpty(visible))
+            return NULL;
+        double part[4];
+        wk_imagePixelsUnder(rect, image, visible, wk_filterMarginForDraw(context, rect, image), part);
+        if (part[3] <= part[1])
+            return NULL;
+        top = (size_t)part[1];
+        bottom = (size_t)part[3];
+    }
+    CGImageRef rowsImage = wk_copyImageWithRowsMatched(image, colorSpace, top, bottom);
+    if (rowsImage)
+        return rowsImage;
+    CGImageRef whole = wk_imageForDestinationColorSpace(image, colorSpace);
+    return CGImageRetain(whole ? whole : image);
 }
 
 // CGContextDrawTiledImage and the pattern setters below draw a private copy of the pixels of a
