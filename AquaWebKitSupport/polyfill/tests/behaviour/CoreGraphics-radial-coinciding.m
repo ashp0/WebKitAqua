@@ -44,6 +44,22 @@ static DrawRadialFn systemDrawRadial(void)
 static CGGradientRef gGradient;
 static CGFloat gAsyncRadius;
 
+// `bgra`, an sRGB colour, as CoreGraphics matches it into a BGRA pixel of `space`, as the window server matches
+// a window of sRGB onto the display a screenshot is taken in.
+static void colourInSpace(CGColorSpaceRef space, const unsigned char bgra[4], unsigned char out[4])
+{
+    CGColorSpaceRef sRGB = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    const CGFloat components[4] = { bgra[2] / 255.0, bgra[1] / 255.0, bgra[0] / 255.0, bgra[3] / 255.0 };
+    CGColorRef colour = CGColorCreate(sRGB, components);
+    CGContextRef pixel = CGBitmapContextCreate(out, 1, 1, 8, 4, space, kBGRA);
+    CGContextSetFillColorWithColor(pixel, colour);
+    CGContextSetBlendMode(pixel, kCGBlendModeCopy);
+    CGContextFillRect(pixel, CGRectMake(0, 0, 1, 1));
+    CGContextRelease(pixel);
+    CGColorRelease(colour);
+    CGColorSpaceRelease(sRGB);
+}
+
 // Pixels of a bitmap (BGRA rows of kSide, row 0 at the top) that break the rule for `options`, given the colours
 // expected inside, outside and untouched. Pixels within half a pixel of the circle are not judged. A tolerance
 // of `slack` per channel admits a renderer that rounds differently.
@@ -266,10 +282,16 @@ int main(void)
                 kCGWindowImageBoundsIgnoreFraming | kCGWindowImageNominalResolution);
             int broken = -1;
             if (shot && CGImageGetWidth(shot) == kSide) {
-                CGContextRef bitmap = CGBitmapContextCreate(NULL, kSide, kSide, 8, kSide * 4, sRGB, kBGRA);
+                // Compared in the screenshot's colour space: a display narrower than sRGB has no sRGB red to return.
+                CGColorSpaceRef screen = CGImageGetColorSpace(shot);
+                unsigned char screenRed[4], screenBlue[4], screenMagenta[4];
+                colourInSpace(screen, red, screenRed);
+                colourInSpace(screen, blue, screenBlue);
+                colourInSpace(screen, magenta, screenMagenta);
+                CGContextRef bitmap = CGBitmapContextCreate(NULL, kSide, kSide, 8, kSide * 4, screen, kBGRA);
                 CGContextDrawImage(bitmap, CGRectMake(0, 0, kSide, kSide), shot);
                 broken = pixelsBreakingRule(CGBitmapContextGetData(bitmap), CGBitmapContextGetBytesPerRow(bitmap), false,
-                    asyncRadii[i].radius, asyncRadii[i].paints, kBoth, red, blue, magenta, 5);
+                    asyncRadii[i].radius, asyncRadii[i].paints, kBoth, screenRed, screenBlue, screenMagenta, 5);
                 CGContextRelease(bitmap);
             }
             if (shot)

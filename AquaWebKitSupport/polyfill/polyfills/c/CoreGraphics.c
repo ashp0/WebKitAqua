@@ -2469,17 +2469,34 @@ static CGImageRef wk_imageForDestinationColorSpace(CGImageRef image, CGColorSpac
 
 // 10.9's software CoreAnimation renderer draws nothing of an image wider or taller than 16384
 // (CA::OGL::SWContext::get, checked in SWContext::bind_image_impl), and CA::CG::IOSurfaceRenderer::acquire
-// draws with it when no accelerated renderer is available. A GeForce GTX TITAN Black with a 16384 texture limit
-// drew a 40000-wide image correctly. Under the software renderer an oversized image is drawn from the part the clip
-// leaves visible, and when that part is itself over the limit, from tiles of it, each within the limit and
-// clipped to its own share of the destination.
+// draws with it when no accelerated renderer is available. The accelerated renderer draws an image over its GPU's
+// texture limit in place only one to one, unturned, at a whole-pixel offset: sampled away from its texel centres --
+// scaled, turned, or at a fractional offset -- it leaves up to a few columns or rows unpainted at its top and right
+// edges, varying with the image's size (on a FirePro D500, limit 16384: an 8x20000 image drawn into 8x1000 pixels
+// leaves one column, a 20000x8 one drawn into 20000x16 its top row half painted), and a part made by
+// CGImageCreateWithImageInRect of such an image is drawn from the same texture. Any other draw of such an image is
+// made by CoreGraphics into a bitmap of the device pixels it reaches, which then replaces them. An image over the
+// software renderer's limit is drawn without rotation or skew from images of its own within the limit, one per tile
+// of the destination's device pixels; turned, skewed, shrunk so far that one device pixel's image would not fit, or
+// under a style reaching further than a quarter of the limit, it takes the same CoreGraphics route.
+// The software renderer also steps a draw's normalized texture coordinates
+// one destination row at a time in single precision (CA::OGL::SW::scanline), each step rounding by up to 2^-25,
+// over the rows the clip leaves of the draw: a draw stepping n device rows of a texture e pixels along a stepped
+// coordinate samples up to n * e / 2^25 pixels from where it should, and every pixel lands in its place while
+// n * e < 2^24. Under the software renderer an image stepping more rows than land in place is drawn whole once
+// per band of the clip's device rows, each clipped to its band and stepping few enough rows. A part made by
+// CGImageCreateWithImageInRect is sampled from its parent's texture.
 WK_SYSTEM_FN("OpenGL", int, CGLChoosePixelFormat, (const int *, void **, int *));
 WK_SYSTEM_FN("OpenGL", int, CGLDestroyPixelFormat, (void *));
 WK_SYSTEM_FN("OpenGL", int, CGLCreateContext, (void *, void *, void **));
 WK_SYSTEM_FN("OpenGL", int, CGLDestroyContext, (void *));
+WK_SYSTEM_FN("OpenGL", void *, CGLGetCurrentContext, (void));
+WK_SYSTEM_FN("OpenGL", int, CGLSetCurrentContext, (void *));
+WK_SYSTEM_FN("OpenGL", void, glGetIntegerv, (unsigned, int *));
 extern bool CGContextGetShouldAntialias(CGContextRef);
 
 static bool wk_hasAcceleratedCoreAnimationRenderer_storage;
+static size_t wk_acceleratedTextureLimit_storage;
 static pthread_once_t wk_acceleratedCoreAnimationRendererOnce = PTHREAD_ONCE_INIT;
 static void wk_build_acceleratedCoreAnimationRenderer(void)
 {
@@ -2492,6 +2509,16 @@ static void wk_build_acceleratedCoreAnimationRenderer(void)
         void *glContext = NULL;
         if (formats > 0 && !WK_SYSTEM(CGLCreateContext)(pixelFormat, NULL, &glContext) && glContext) {
             wk_hasAcceleratedCoreAnimationRenderer_storage = true;
+            // GL_MAX_TEXTURE_SIZE and GL_MAX_RECTANGLE_TEXTURE_SIZE_ARB.
+            void *current = WK_SYSTEM(CGLGetCurrentContext)();
+            int textureSize = 0, rectangleSize = 0;
+            if (!WK_SYSTEM(CGLSetCurrentContext)(glContext)) {
+                WK_SYSTEM(glGetIntegerv)(0x0D33, &textureSize);
+                WK_SYSTEM(glGetIntegerv)(0x84F8, &rectangleSize);
+                WK_SYSTEM(CGLSetCurrentContext)(current);
+            }
+            int limit = rectangleSize > 0 && rectangleSize < textureSize ? rectangleSize : textureSize;
+            wk_acceleratedTextureLimit_storage = limit > 0 ? (size_t)limit : 16384;
             WK_SYSTEM(CGLDestroyContext)(glContext);
         }
         WK_SYSTEM(CGLDestroyPixelFormat)(pixelFormat);
@@ -2509,10 +2536,23 @@ size_t wk_coreAnimationTextureLimit(void)
     return wk_hasAcceleratedCoreAnimationRenderer() ? 0 : 16384;
 }
 
+// The largest image either renderer draws whole: 16384 for the software renderer, the GPU's texture limit for the
+// accelerated one.
+static size_t wk_imageTextureLimit(void)
+{
+    return wk_hasAcceleratedCoreAnimationRenderer() ? wk_acceleratedTextureLimit_storage : 16384;
+}
+
 static bool wk_drawOversizedImageInIOSurface(CGContextRef, CGRect, CGImageRef);
 static CGImageRef wk_copyImageForDraw(CGContextRef, CGRect, CGImageRef, CGColorSpaceRef);
 static const void *wk_imageSurfaceKey(void);
 static bool wk_drawSurfaceImageShownPart(CGContextRef, CGRect, CGImageRef);
+static bool wk_beginStyledDraw(CGContextRef, CGBlendMode, bool, wk_blend_read_back *, CGRect);
+static void wk_endStyledDraw(wk_blend_read_back *);
+static bool wk_insideOffscreenSurfaceLayer(CGContextRef);
+extern void CGContextSetCTM(CGContextRef, CGAffineTransform);
+static IOSurfaceRef wk_createBGRASurface(size_t width, size_t height);
+static const CGBitmapInfo wk_bgraInfo = kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaPremultipliedFirst;
 
 // Direct IOSurface contexts and asynchronous CA layer contexts share this renderer delegate.
 extern CGContextRef CGIOSurfaceContextCreate(IOSurfaceRef, size_t, size_t, size_t, size_t, CGColorSpaceRef, CGBitmapInfo);
@@ -2655,18 +2695,90 @@ WK_POLYFILL_REPLACES("CoreGraphics", void, CGContextClipToRects, (CGContextRef c
     free(bounded);
 }
 
-// Image pixels run with the rect's x, and the image's first row lies along the rect's maxY edge.
-static void wk_drawImagePart(CGContextRef context, CGRect rect, CGImageRef image, double left, double top, double right, double bottom)
+// CGIOSurfaceContextCreateImage — a DELIBERATE REPLACEMENT of a present 10.9 function. Its image keeps its
+// context's surface and that surface's seed, from which the rows a draw reads are taken while the seed is
+// unchanged.
+WK_POLYFILL_REPLACES("CoreGraphics", CGImageRef, CGIOSurfaceContextCreateImage, (CGContextRef context))
 {
-    double pixelsPerUnitX = CGImageGetWidth(image) / rect.size.width;
-    double pixelsPerUnitY = CGImageGetHeight(image) / rect.size.height;
-    CGImageRef part = CGImageCreateWithImageInRect(image, CGRectMake(left, top, right - left, bottom - top));
-    if (!part)
-        return;
-    CGRect partRect = CGRectMake(CGRectGetMinX(rect) + left / pixelsPerUnitX, CGRectGetMaxY(rect) - bottom / pixelsPerUnitY,
-        (right - left) / pixelsPerUnitX, (bottom - top) / pixelsPerUnitY);
-    WK_ORIGINAL(CGContextDrawImage)(context, partRect, part);
-    CGImageRelease(part);
+    CGImageRef image = WK_ORIGINAL(CGIOSurfaceContextCreateImage)(context);
+    IOSurfaceRef surface = image ? CGIOSurfaceContextGetSurface(context) : NULL;
+    if (surface) {
+        uint32_t seed = WK_SYSTEM(IOSurfaceGetSeed)(surface);
+        CFNumberRef seedNumber = CFNumberCreate(NULL, kCFNumberSInt32Type, &seed);
+        const void *values[] = { surface, seedNumber };
+        CFArrayRef record = CFArrayCreate(NULL, values, 2, &kCFTypeArrayCallBacks);
+        objc_setAssociatedObject((id)image, wk_imageSurfaceKey(), (id)(void *)record, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        CFRelease(record);
+        CFRelease(seedNumber);
+    }
+    return image;
+}
+
+// What `image` paints from pixel `left`, `top` to `right`, `bottom`, copied one to one by QuartzCore, which reads
+// an image of an IOSurface context from its surface, into an image of `colorSpace` of its own -- of the image's
+// own space, or sRGB, when `colorSpace` is not RGB -- or NULL. Under the
+// software renderer the copy is made a band of rows at a time, each band a part of `image` sampled from `image`'s
+// texture and its mask's, and few enough rows to land in place from them. The copy of an image that does not
+// interpolate is an image of the copied bytes that does not interpolate either.
+static CGImageRef wk_copyImagePart(CGImageRef image, CGColorSpaceRef colorSpace, double left, double top, double right, double bottom)
+{
+    size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+    size_t partWidth = (size_t)(right - left), partHeight = (size_t)(bottom - top);
+    CGColorSpaceRef imageSpace = CGImageGetColorSpace(image), sRGB = NULL;
+    if (CGColorSpaceGetModel(colorSpace) != kCGColorSpaceModelRGB) {
+        if (imageSpace && CGColorSpaceGetModel(imageSpace) == kCGColorSpaceModelRGB)
+            colorSpace = imageSpace;
+        else if (!(colorSpace = sRGB = WK_SYSTEM(CGColorSpaceCreateWithName)(kCGColorSpaceSRGB)))
+            return NULL;
+    }
+    IOSurfaceRef surface = wk_createBGRASurface(partWidth, partHeight);
+    CGContextRef context = surface ? CGIOSurfaceContextCreate(surface, partWidth, partHeight, 8, 32, colorSpace, wk_bgraInfo) : NULL;
+    CGImageRef copy = NULL;
+    if (context) {
+        CGContextSetBlendMode(context, kCGBlendModeCopy);
+        CGContextSetInterpolationQuality(context, kCGInterpolationNone);
+        if (!wk_coreAnimationTextureLimit())
+            WK_ORIGINAL(CGContextDrawImage)(context, CGRectMake(-left, bottom - height, width, height), image);
+        else {
+            CGImageRef mask = CGImageGetMask(image);
+            double extent = fmax(height, mask ? CGImageGetHeight(mask) : 0);
+            double bandRows = fmax(floor(16777216.0 / extent) - 2, 1);
+            for (double bandTop = top; bandTop < bottom; bandTop += bandRows) {
+                double bandBottom = fmin(bandTop + bandRows, bottom);
+                CGImageRef band = CGImageCreateWithImageInRect(image, CGRectMake(left, bandTop, partWidth, bandBottom - bandTop));
+                if (band) {
+                    WK_ORIGINAL(CGContextDrawImage)(context, CGRectMake(0, bottom - bandBottom, partWidth, bandBottom - bandTop), band);
+                    CGImageRelease(band);
+                }
+            }
+        }
+        CGContextFlush(context);
+        if (CGImageGetShouldInterpolate(image))
+            copy = WK_ORIGINAL(CGIOSurfaceContextCreateImage)(context);
+        else if (!WK_SYSTEM(IOSurfaceLock)(surface, kIOSurfaceLockReadOnly, NULL)) {
+            CFMutableDataRef bytes = CFDataCreateMutable(kCFAllocatorDefault, 0);
+            if (bytes) {
+                CFDataSetLength(bytes, (CFIndex)(partWidth * partHeight * 4));
+                const uint8_t *in = (const uint8_t *)WK_SYSTEM(IOSurfaceGetBaseAddress)(surface);
+                size_t stride = WK_SYSTEM(IOSurfaceGetBytesPerRow)(surface);
+                for (size_t row = 0; row < partHeight; row++)
+                    memcpy(CFDataGetMutableBytePtr(bytes) + row * partWidth * 4, in + row * stride, partWidth * 4);
+                CGDataProviderRef provider = CGDataProviderCreateWithCFData(bytes);
+                copy = provider ? CGImageCreate(partWidth, partHeight, 8, 32, partWidth * 4, colorSpace, wk_bgraInfo, provider, NULL, false,
+                    kCGRenderingIntentDefault) : NULL;
+                if (provider)
+                    CGDataProviderRelease(provider);
+                CFRelease(bytes);
+            }
+            WK_SYSTEM(IOSurfaceUnlock)(surface, kIOSurfaceLockReadOnly, NULL);
+        }
+        CGContextRelease(context);
+    }
+    if (surface)
+        CFRelease(surface);
+    if (sRGB)
+        CGColorSpaceRelease(sRGB);
+    return copy;
 }
 
 // The part of `rect` whose drawing can reach the clip, or an empty rect. A style -- a shadow, a focus ring --
@@ -2701,6 +2813,21 @@ static double wk_filterMarginForDraw(CGContextRef context, CGRect rect, CGImageR
     return ceil(2 / wk_devicePixelsPerImagePixel(context, rect, image)) + 2;
 }
 
+// The image pixels a style -- a shadow, a focus ring -- reaches from the pixels it is drawn with, in a draw of
+// `image` into `rect`, or 0 without a style. CGStyleGetDrawBoundingBox outsets a base-space rect by the reach.
+static double wk_styleReachInImagePixels(CGContextRef context, CGRect rect, CGImageRef image)
+{
+    CGStyleRef style = CGContextGetStyle(context);
+    CGRect reach = style ? CGStyleGetDrawBoundingBox(style, CGRectMake(0, 0, 1, 1)) : CGRectNull;
+    if (CGRectIsNull(reach) || CGRectIsInfinite(reach))
+        return 0;
+    double devicePixels = fmax(fmax(-CGRectGetMinX(reach), -CGRectGetMinY(reach)), fmax(CGRectGetMaxX(reach) - 1, CGRectGetMaxY(reach) - 1));
+    CGAffineTransform ctm = CGContextGetCTM(context);
+    double imagePixelsPerDevicePixel = fmax(CGImageGetWidth(image) / rect.size.width / hypot(ctm.a, ctm.b),
+        CGImageGetHeight(image) / rect.size.height / hypot(ctm.c, ctm.d));
+    return ceil(fmax(devicePixels, 0) * imagePixelsPerDevicePixel);
+}
+
 // The image pixels, as left, top, right and bottom, under `visible` in a draw of `image` into `rect`, widened
 // by `margin` on every side and kept within the image.
 static void wk_imagePixelsUnder(CGRect rect, CGImageRef image, CGRect visible, double margin, double part[4])
@@ -2713,60 +2840,169 @@ static void wk_imagePixelsUnder(CGRect rect, CGImageRef image, CGRect visible, d
     part[3] = fmin(ceil((CGRectGetMaxY(rect) - CGRectGetMinY(visible)) * pixelsPerUnitY) + margin, height);
 }
 
-// Answers whether the draw was made here; false leaves it to 10.9, which draws an image within the limit.
+// The device rows the software renderer steps drawing `rect`: those the clip's bounding box leaves of it.
+static double wk_steppedDeviceRows(CGContextRef context, CGRect rect)
+{
+    CGRect drawn = CGRectIntersection(rect, CGContextGetClipBoundingBox(context));
+    if (CGRectIsNull(drawn) || CGRectIsEmpty(drawn))
+        return 0;
+    return ceil(CGRectApplyAffineTransform(drawn, CGContextGetCTM(context)).size.height) + 1;
+}
+
+// The texture extent of a `pixelsWide` by `pixelsHigh` image along the coordinates stepped per device row: its height
+// when its rows lie along device rows, otherwise its larger side.
+static double wk_steppedExtent(CGAffineTransform ctm, double pixelsWide, double pixelsHigh)
+{
+    return ctm.b == 0 && ctm.c == 0 ? pixelsHigh : fmax(pixelsWide, pixelsHigh);
+}
+
+static bool wk_softwareRendererPlacesExactly(double steppedRows, double extent)
+{
+    return steppedRows * extent < 16777216.0;
+}
+
+static void wk_releasePartParent(void *info, const void *data, size_t size)
+{
+    (void)data;
+    (void)size;
+    CGImageRelease((CGImageRef)info);
+}
+
+// The pixels of `image` from `left`, `top` to `right`, `bottom` as an image of their own over `image`'s own bytes,
+// with its format, decode, interpolation and intent, or NULL when its provider holds no directly addressable bytes or
+// it is masked.
+extern const void *CGDataProviderGetBytePtr(CGDataProviderRef);
+static CGImageRef wk_createImagePartOverBytes(CGImageRef image, double left, double top, double right, double bottom)
+{
+    size_t bitsPerPixel = CGImageGetBitsPerPixel(image), bytesPerRow = CGImageGetBytesPerRow(image);
+    if (CGImageIsMask(image) || CGImageGetMask(image) || CGImageGetMaskingColors(image) || bitsPerPixel % 8)
+        return NULL;
+    CGDataProviderRef provider = CGImageGetDataProvider(image);
+    const uint8_t *bytes = provider ? (const uint8_t *)CGDataProviderGetBytePtr(provider) : NULL;
+    if (!bytes)
+        return NULL;
+    size_t width = (size_t)(right - left), height = (size_t)(bottom - top);
+    size_t offset = (size_t)top * bytesPerRow + (size_t)left * (bitsPerPixel / 8);
+    size_t size = (height - 1) * bytesPerRow + width * (bitsPerPixel / 8);
+    CGDataProviderRef partProvider = CGDataProviderCreateWithData((void *)CGImageRetain(image), bytes + offset, size, wk_releasePartParent);
+    if (!partProvider)
+        return NULL;
+    CGImageRef part = CGImageCreate(width, height, CGImageGetBitsPerComponent(image), bitsPerPixel, bytesPerRow, CGImageGetColorSpace(image),
+        CGImageGetBitmapInfo(image), partProvider, CGImageGetDecode(image), CGImageGetShouldInterpolate(image), CGImageGetRenderingIntent(image));
+    CGDataProviderRelease(partProvider);
+    return part;
+}
+
+// Draws `image` into `rect` under the software renderer once per band of the clip's device rows, each clipped
+// without antialiasing to its band and stepping few enough rows, so every destination pixel is painted by one draw
+// of the whole image with the context's alpha, blend mode and style.
+static void wk_drawInDeviceRowBands(CGContextRef context, CGRect rect, CGImageRef image)
+{
+    CGAffineTransform ctm = CGContextGetCTM(context);
+    double extent = wk_steppedExtent(ctm, CGImageGetWidth(image), CGImageGetHeight(image));
+    double bandRows = fmax(floor(16777216.0 / extent) - 2, 1);
+    CGRect deviceClip = CGRectIntegral(CGRectApplyAffineTransform(CGContextGetClipBoundingBox(context), ctm));
+    bool antialias = CGContextGetShouldAntialias(context);
+    for (double bandBottom = CGRectGetMinY(deviceClip); bandBottom < CGRectGetMaxY(deviceClip); bandBottom += bandRows) {
+        CGContextSaveGState(context);
+        CGContextSetCTM(context, CGAffineTransformIdentity);
+        CGContextSetShouldAntialias(context, false);
+        CGContextClipToRect(context, CGRectMake(CGRectGetMinX(deviceClip), bandBottom, deviceClip.size.width,
+            fmin(bandRows, CGRectGetMaxY(deviceClip) - bandBottom)));
+        CGContextSetShouldAntialias(context, antialias);
+        CGContextSetCTM(context, ctm);
+        WK_ORIGINAL(CGContextDrawImage)(context, rect, image);
+        CGContextRestoreGState(context);
+    }
+}
+
+// Answers whether the draw was made here; false leaves it to 10.9, which draws an image within the limit, stepping
+// few enough rows, in its place.
 static bool wk_drawOversizedImageInIOSurface(CGContextRef context, CGRect rect, CGImageRef image)
 {
-    size_t limit = wk_coreAnimationTextureLimit();
+    bool software = !wk_hasAcceleratedCoreAnimationRenderer();
+    size_t limit = wk_imageTextureLimit();
     size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
-    if (!limit || (width <= limit && height <= limit))
-        return false;
     if (CGImageIsMask(image) || !(rect.size.width > 0) || !(rect.size.height > 0))
         return false;
+    CGAffineTransform ctm = CGContextGetCTM(context);
+    if (width <= limit && height <= limit) {
+        if (!software || wk_softwareRendererPlacesExactly(wk_steppedDeviceRows(context, rect), wk_steppedExtent(ctm, width, height)))
+            return false;
+        wk_drawInDeviceRowBands(context, rect, image);
+        return true;
+    }
+    if (!software) {
+        CGPoint origin = CGPointApplyAffineTransform(rect.origin, ctm);
+        if (ctm.b == 0 && ctm.c == 0 && fabs(ctm.a * rect.size.width) == width && fabs(ctm.d * rect.size.height) == height
+            && origin.x == floor(origin.x) && origin.y == floor(origin.y))
+            return false;
+    }
 
-    CGRect visible = wk_visiblePartOfDraw(context, rect);
-    if (CGRectIsEmpty(visible))
+    if (CGRectIsEmpty(wk_visiblePartOfDraw(context, rect)))
         return true;
 
-    // A tile's core still has to cover a destination pixel, which bounds the filter margin on either side of it.
+    // Without rotation or skew: tiles of whole device pixels over the clip, each clipped without antialiasing, so
+    // every destination pixel is painted by one tile with the context's alpha, blend mode and style. A tile draws the
+    // image pixels it maps to, with those its filter reads and those whose style paints into it, as an image over the
+    // image's bytes, or else a part made by CGImageCreateWithImageInRect, which the software renderer draws from the
+    // part's own texture when the image is over its limit.
     double pixelsPerUnitX = width / rect.size.width, pixelsPerUnitY = height / rect.size.height;
-    double pixelsPerDevicePixel = ceil(1 / wk_devicePixelsPerImagePixel(context, rect, image));
-    double margin = fmax(fmin(wk_filterMarginForDraw(context, rect, image), floor((limit - pixelsPerDevicePixel) / 2)), 0);
-
-    double part[4];
-    wk_imagePixelsUnder(rect, image, visible, margin, part);
-    double left = part[0], top = part[1], right = part[2], bottom = part[3];
-    if (right <= left || bottom <= top)
-        return true;
-    if (right - left <= limit && bottom - top <= limit) {
-        wk_drawImagePart(context, rect, image, left, top, right, bottom);
-        return true;
-    }
-
-    // Tiles meet along image pixel boundaries. Each is clipped, without antialiasing, to its share of the
-    // destination -- extended past the rect on the part's outer sides -- so every destination pixel is
-    // painted by exactly one tile, and each tile carries the neighbours its filter reads. The tiles paint
-    // into one transparency layer, so the context's alpha, blend mode and shadow apply to the image once.
-    double core = limit - 2 * margin;
-    bool antialias = CGContextGetShouldAntialias(context);
-    CGContextBeginTransparencyLayerWithRect(context, visible, NULL);
-    for (double rowStart = top; rowStart < bottom; rowStart += core) {
-        double rowEnd = fmin(rowStart + core, bottom);
-        double clipTop = rowStart == top ? CGRectGetMaxY(rect) + rect.size.height : CGRectGetMaxY(rect) - rowStart / pixelsPerUnitY;
-        double clipBottom = rowEnd == bottom ? CGRectGetMinY(rect) - rect.size.height : CGRectGetMaxY(rect) - rowEnd / pixelsPerUnitY;
-        for (double columnStart = left; columnStart < right; columnStart += core) {
-            double columnEnd = fmin(columnStart + core, right);
-            double clipLeft = columnStart == left ? CGRectGetMinX(rect) - rect.size.width : CGRectGetMinX(rect) + columnStart / pixelsPerUnitX;
-            double clipRight = columnEnd == right ? CGRectGetMaxX(rect) + rect.size.width : CGRectGetMinX(rect) + columnEnd / pixelsPerUnitX;
-            CGContextSaveGState(context);
-            CGContextSetShouldAntialias(context, false);
-            CGContextClipToRect(context, CGRectMake(clipLeft, clipBottom, clipRight - clipLeft, clipTop - clipBottom));
-            CGContextSetShouldAntialias(context, antialias);
-            wk_drawImagePart(context, rect, image, fmax(columnStart - margin, 0), fmax(rowStart - margin, 0),
-                fmin(columnEnd + margin, width), fmin(rowEnd + margin, height));
-            CGContextRestoreGState(context);
+    double reach = wk_styleReachInImagePixels(context, rect, image);
+    double margin = wk_filterMarginForDraw(context, rect, image) + reach;
+    CGAffineTransform toImage = CGAffineTransformConcat(CGAffineTransformInvert(ctm),
+        CGAffineTransformMake(pixelsPerUnitX, 0, 0, -pixelsPerUnitY, -CGRectGetMinX(rect) * pixelsPerUnitX, CGRectGetMaxY(rect) * pixelsPerUnitY));
+    double imagePixelsPerDevicePixel = fmax(fabs(toImage.a) + fabs(toImage.c), fabs(toImage.b) + fabs(toImage.d));
+    double tile = floor((limit - 2 * margin - 2) / imagePixelsPerDevicePixel);
+    if (software && ctm.b == 0 && ctm.c == 0 && tile >= 1 && reach <= floor(limit / 4.0)) {
+        CGRect deviceClip = CGRectIntegral(CGRectApplyAffineTransform(CGContextGetClipBoundingBox(context), ctm));
+        bool antialias = CGContextGetShouldAntialias(context);
+        for (double tileY = CGRectGetMinY(deviceClip); tileY < CGRectGetMaxY(deviceClip); tileY += tile) {
+            for (double tileX = CGRectGetMinX(deviceClip); tileX < CGRectGetMaxX(deviceClip); tileX += tile) {
+                CGRect deviceTile = CGRectMake(tileX, tileY, fmin(tile, CGRectGetMaxX(deviceClip) - tileX), fmin(tile, CGRectGetMaxY(deviceClip) - tileY));
+                CGRect pixels = CGRectApplyAffineTransform(deviceTile, toImage);
+                double partLeft = fmax(floor(CGRectGetMinX(pixels) - margin), 0), partTop = fmax(floor(CGRectGetMinY(pixels) - margin), 0);
+                double partRight = fmin(ceil(CGRectGetMaxX(pixels) + margin), width), partBottom = fmin(ceil(CGRectGetMaxY(pixels) + margin), height);
+                if (partRight <= partLeft || partBottom <= partTop)
+                    continue;
+                CGImageRef part = wk_createImagePartOverBytes(image, partLeft, partTop, partRight, partBottom);
+                if (!part)
+                    part = CGImageCreateWithImageInRect(image, CGRectMake(partLeft, partTop, partRight - partLeft, partBottom - partTop));
+                if (!part)
+                    continue;
+                CGRect partRect = CGRectMake(CGRectGetMinX(rect) + partLeft / pixelsPerUnitX, CGRectGetMaxY(rect) - partBottom / pixelsPerUnitY,
+                    (partRight - partLeft) / pixelsPerUnitX, (partBottom - partTop) / pixelsPerUnitY);
+                CGContextSaveGState(context);
+                CGContextSetCTM(context, CGAffineTransformIdentity);
+                CGContextSetShouldAntialias(context, false);
+                CGContextClipToRect(context, deviceTile);
+                CGContextSetShouldAntialias(context, antialias);
+                CGContextSetCTM(context, ctm);
+                if (software && !wk_softwareRendererPlacesExactly(wk_steppedDeviceRows(context, partRect),
+                    wk_steppedExtent(ctm, CGImageGetWidth(part), CGImageGetHeight(part))))
+                    wk_drawInDeviceRowBands(context, partRect, part);
+                else
+                    WK_ORIGINAL(CGContextDrawImage)(context, partRect, part);
+                CGContextRestoreGState(context);
+                CGImageRelease(part);
+            }
         }
+        return true;
     }
-    CGContextEndTransparencyLayer(context);
+
+    // Otherwise CoreGraphics draws the image, with the context's state, into a bitmap of the device pixels the draw
+    // and its style reach within the clip; the bitmap, within the limit, then replaces those pixels.
+    CGRect deviceReach = CGRectApplyAffineTransform(rect, ctm);
+    CGStyleRef style = CGContextGetStyle(context);
+    if (style) {
+        CGRect styled = CGStyleGetDrawBoundingBox(style, deviceReach);
+        deviceReach = CGRectIsNull(styled) || CGRectIsInfinite(styled) ? CGRectInfinite : CGRectUnion(deviceReach, styled);
+    }
+    wk_blend_read_back readBack;
+    if (!wk_beginStyledDraw(context, CGContextGetBlendMode(context), !wk_insideOffscreenSurfaceLayer(context), &readBack, deviceReach))
+        return false;
+    WK_ORIGINAL(CGContextDrawImage)(readBack.target, rect, image);
+    wk_endStyledDraw(&readBack);
     return true;
 }
 
@@ -2791,25 +3027,6 @@ static const void *wk_imageSurfaceKey(void)
     if (!key)
         key = (const void *)sel_registerName("wk_imageSurface");
     return key;
-}
-
-// CGIOSurfaceContextCreateImage — a DELIBERATE REPLACEMENT of a present 10.9 function. Its image keeps its
-// context's surface and that surface's seed, from which the rows a draw reads are taken while the seed is
-// unchanged.
-WK_POLYFILL_REPLACES("CoreGraphics", CGImageRef, CGIOSurfaceContextCreateImage, (CGContextRef context))
-{
-    CGImageRef image = WK_ORIGINAL(CGIOSurfaceContextCreateImage)(context);
-    IOSurfaceRef surface = image ? CGIOSurfaceContextGetSurface(context) : NULL;
-    if (surface) {
-        uint32_t seed = WK_SYSTEM(IOSurfaceGetSeed)(surface);
-        CFNumberRef seedNumber = CFNumberCreate(NULL, kCFNumberSInt32Type, &seed);
-        const void *values[] = { surface, seedNumber };
-        CFArrayRef record = CFArrayCreate(NULL, values, 2, &kCFTypeArrayCallBacks);
-        objc_setAssociatedObject((id)image, wk_imageSurfaceKey(), (id)(void *)record, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        CFRelease(record);
-        CFRelease(seedNumber);
-    }
-    return image;
 }
 
 // The (colour space, surface, context, matched-row flags) entry of `rows`, a flat array, for `colorSpace`.
@@ -2841,8 +3058,6 @@ static IOSurfaceRef wk_createBGRASurface(size_t width, size_t height)
     CFRelease(widthNumber);
     return surface;
 }
-
-static const CGBitmapInfo wk_bgraInfo = kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaPremultipliedFirst;
 
 // Under the accelerated renderer, rows of an image of an IOSurface context whose surface is unchanged are copied
 // by that renderer, exactly, into a surface of their own and matched from there.
@@ -2925,8 +3140,8 @@ static CGImageRef wk_copyImageWithRowsMatched(CGImageRef image, CGColorSpaceRef 
         || CGColorSpaceGetModel(imageSpace) != kCGColorSpaceModelRGB || CGColorSpaceGetModel(colorSpace) != kCGColorSpaceModelRGB
         || WK_SYSTEM(CGColorSpaceEqualToColorSpace)(imageSpace, colorSpace))
         return NULL;
-    size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image), limit = wk_coreAnimationTextureLimit();
-    if (!width || !height || width > INT_MAX || height > INT_MAX || (limit && (width > limit || height > limit)))
+    size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image), limit = wk_imageTextureLimit();
+    if (!width || !height || width > INT_MAX || height > INT_MAX || width > limit || height > limit)
         return NULL;
     const wk_rgb_match *match = wk_rgbMatch(imageSpace, colorSpace, CGImageGetRenderingIntent(image));
     if (!match)
@@ -3029,16 +3244,13 @@ static CGImageRef wk_copyImageForDraw(CGContextRef context, CGRect rect, CGImage
 // under the accelerated renderer. A draw that maps an image of an IOSurface context onto whole device pixels
 // one to one -- no scale, rotation or flip, a whole-pixel offset -- and carries no style paints the same pixels
 // from the part of the image its clip shows; under a shadow it does not. That part is copied out of the image
-// by QuartzCore into a surface of its own and drawn instead; an image or part over the renderer's texture limit
-// goes through wk_drawOversizedImageInIOSurface. The software renderer places the rows of an image 8193 to 16383
-// pixels tall a row or two off, so an image over 8192 pixels tall is drawn whole there. Answers whether the
-// draw was made here.
+// by wk_copyImagePart and drawn instead. A part the software renderer would draw out of place is left to
+// wk_drawOversizedImageInIOSurface, which draws the image in bands. Answers whether the draw was made here.
 static bool wk_drawSurfaceImageShownPart(CGContextRef context, CGRect rect, CGImageRef image)
 {
     size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
     if (!objc_getAssociatedObject((id)image, wk_imageSurfaceKey()) || CGImageGetBitmapInfo(image) != wk_bgraInfo
-        || rect.size.width != (CGFloat)width || rect.size.height != (CGFloat)height
-        || (!wk_hasAcceleratedCoreAnimationRenderer() && height > 8192))
+        || rect.size.width != (CGFloat)width || rect.size.height != (CGFloat)height)
         return false;
     CGAffineTransform ctm = CGContextGetCTM(context);
     double originX = ctm.tx + rect.origin.x, originY = ctm.ty + rect.origin.y;
@@ -3059,24 +3271,13 @@ static bool wk_drawSurfaceImageShownPart(CGContextRef context, CGRect rect, CGIm
         return false;
 
     size_t partWidth = (size_t)(right - left), partHeight = (size_t)(bottom - top);
-    IOSurfaceRef surface = wk_createBGRASurface(partWidth, partHeight);
-    CGContextRef partContext = surface ? CGIOSurfaceContextCreate(surface, partWidth, partHeight, 8, 32, CGImageGetColorSpace(image), wk_bgraInfo) : NULL;
-    CGImageRef part = NULL;
-    if (partContext) {
-        CGContextSetBlendMode(partContext, kCGBlendModeCopy);
-        CGContextSetInterpolationQuality(partContext, kCGInterpolationNone);
-        CGRect imageRect = CGRectMake(-left, bottom - height, width, height);
-        if (!wk_drawOversizedImageInIOSurface(partContext, imageRect, image))
-            WK_ORIGINAL(CGContextDrawImage)(partContext, imageRect, image);
-        CGContextFlush(partContext);
-        part = WK_ORIGINAL(CGIOSurfaceContextCreateImage)(partContext);
-        CGContextRelease(partContext);
-    }
-    if (surface)
-        CFRelease(surface);
+    CGRect partRect = CGRectMake(CGRectGetMinX(rect) + left, CGRectGetMaxY(rect) - bottom, partWidth, partHeight);
+    if (wk_coreAnimationTextureLimit() && !wk_softwareRendererPlacesExactly(partHeight + 1, partHeight))
+        return false;
+    CGColorSpaceRef colorSpace = CGContextGetColorSpace(context);
+    CGImageRef part = colorSpace ? wk_copyImagePart(image, colorSpace, left, top, right, bottom) : NULL;
     if (!part)
         return false;
-    CGRect partRect = CGRectMake(CGRectGetMinX(rect) + left, CGRectGetMaxY(rect) - bottom, partWidth, partHeight);
     if (!wk_drawOversizedImageInIOSurface(context, partRect, part))
         WK_ORIGINAL(CGContextDrawImage)(context, partRect, part);
     CGImageRelease(part);
@@ -3857,7 +4058,7 @@ static bool wk_beginReadBack(CGContextRef context, CGBlendMode mode, wk_blend_re
 
 // `blends` composites over the destination in the bitmap; otherwise the bitmap holds the draw alone, which reaches the
 // context under the context's own blend mode.
-static bool wk_beginStyledDraw(CGContextRef context, CGBlendMode mode, bool blends, wk_blend_read_back *readBack)
+static bool wk_beginStyledDraw(CGContextRef context, CGBlendMode mode, bool blends, wk_blend_read_back *readBack, CGRect deviceBounds)
 {
     wk_surface_drawable drawable;
     if (!wk_contextDrawable(context, &drawable))
@@ -3865,6 +4066,8 @@ static bool wk_beginStyledDraw(CGContextRef context, CGBlendMode mode, bool blen
     CGAffineTransform ctm = CGContextGetCTM(context);
     CGRect region = CGRectIntersection(CGRectIntegral(CGRectApplyAffineTransform(CGContextGetClipBoundingBox(context), ctm)),
         CGRectMake(0, 0, drawable.width, drawable.height));
+    if (!CGRectIsInfinite(deviceBounds))
+        region = CGRectIntersection(region, CGRectIntegral(deviceBounds));
     if (CGRectIsNull(region) || CGRectIsEmpty(region) || !(ctm.a * ctm.d - ctm.b * ctm.c))
         return false;
     CGColorSpaceRef space = CGContextGetColorSpace(context);
@@ -3952,7 +4155,7 @@ bool wk_blendReadBackBegin(CGContextRef context, wk_blend_read_back *readBack)
     if (!blends && !dropsStyle)
         return false;
     if (style)
-        return wk_beginStyledDraw(context, mode, blends, readBack);
+        return wk_beginStyledDraw(context, mode, blends, readBack, CGRectInfinite);
     return wk_beginReadBack(context, mode, readBack);
 }
 

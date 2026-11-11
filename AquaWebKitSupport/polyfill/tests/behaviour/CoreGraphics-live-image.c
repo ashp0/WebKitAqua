@@ -42,16 +42,18 @@ static CGImageRef imageWithPixels(unsigned char *pixels, CGColorSpaceRef space, 
 
 static int draw(CGColorSpaceRef space, CGImageRef image, CGPatternRef pattern, DrawTiled tiled, unsigned char *result)
 {
-    int width = side, bytesPerElement = 4;
+    int width = side, bytesPerElement = 4, pixelFormat = 'BGRA';
     CFNumberRef w = CFNumberCreate(NULL, kCFNumberIntType, &width);
     CFNumberRef b = CFNumberCreate(NULL, kCFNumberIntType, &bytesPerElement);
-    const void *keys[] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement };
-    const void *values[] = { w, w, b };
-    CFDictionaryRef properties = CFDictionaryCreate(NULL, keys, values, 3, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFNumberRef f = CFNumberCreate(NULL, kCFNumberIntType, &pixelFormat);
+    const void *keys[] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfacePixelFormat };
+    const void *values[] = { w, w, b, f };
+    CFDictionaryRef properties = CFDictionaryCreate(NULL, keys, values, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     IOSurfaceRef surface = IOSurfaceCreate(properties);
     CFRelease(properties);
     CFRelease(w);
     CFRelease(b);
+    CFRelease(f);
     CGContextRef context = surface ? CGIOSurfaceContextCreate(surface, side, side, 8, 32, space,
         kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little) : NULL;
     if (!context) {
@@ -59,6 +61,7 @@ static int draw(CGColorSpaceRef space, CGImageRef image, CGPatternRef pattern, D
             CFRelease(surface);
         return 0;
     }
+    CGContextClearRect(context, CGRectMake(0, 0, side, side));
     if (pattern) {
         CGColorSpaceRef patternSpace = CGColorSpaceCreatePattern(NULL);
         CGContextSetFillColorSpace(context, patternSpace);

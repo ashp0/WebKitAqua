@@ -7,10 +7,9 @@
 // The crash cases run in a child: this binary re-executed with --crash-case N. A forked child cannot
 // make an IOSurface context on this OS, so the child is a fresh process. A child that dies on a signal,
 // or cannot make its context, is a FAIL. Against 10.9's own definitions those children crash, so this
-// gate fails on stock. The byte-identity cases run in-process, comparing the replacement with 10.9; an
-// image whose colour space is not the surface's reaches QuartzCore matched by CoreGraphics' bitmap route
-// (the CGContextDrawImage replacement's per-colour-space image), so where that matching differs from
-// QuartzCore's the comparison is with 10.9's draw of the image so matched.
+// gate fails on stock. The other cases run in-process. A draw into a surface of the image's own colour
+// space is compared byte for byte with 10.9's; an image tiled into another colour space is matched by the
+// archive, and is compared byte for byte with CoreGraphics' floating-point match of it, rounded.
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <IOSurface/IOSurface.h>
@@ -57,11 +56,12 @@ static IOSurfaceRef makeSurface(void)
     CFDictionaryRef d = CFDictionaryCreate(NULL, k, v, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     IOSurfaceRef s = IOSurfaceCreate(d); CFRelease(d); CFRelease(w); CFRelease(e); CFRelease(f); return s;
 }
-// Tile `image` into a fresh IOSurface of `space` and copy the surface bytes.
+// Tile `image` into a fresh, cleared IOSurface of `space` and copy the surface bytes.
 static unsigned char *tileToSurface(void (*draw)(CGContextRef, CGRect, CGImageRef), CGColorSpaceRef space, CGImageRef image)
 {
     IOSurfaceRef s = makeSurface();
     CGContextRef c = CGIOSurfaceContextCreate(s, kSide, kSide, 8, 32, space, (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    CGContextClearRect(c, CGRectMake(0, 0, kSide, kSide));
     draw(c, CGRectMake(0, 0, kSide, kSide), image);
     CGContextFlush(c);
     unsigned char *out = malloc(kSide * kSide * 4);
@@ -69,6 +69,41 @@ static unsigned char *tileToSurface(void (*draw)(CGContextRef, CGRect, CGImageRe
     memcpy(out, IOSurfaceGetBaseAddress(s), kSide * kSide * 4);
     IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
     CGContextRelease(c); CFRelease(s); return out;
+}
+
+// `image` tiled into a float bitmap of `space` by CoreGraphics, which matches in floating point, rounded to
+// 8-bit premultiplied BGRA: the exact match the archive's own match of a tiled image lands on.
+static unsigned char *tileExactly(CGColorSpaceRef space, CGImageRef image)
+{
+    float *pixels = calloc(kSide * kSide, 4 * sizeof(float));
+    CGContextRef c = CGBitmapContextCreate(pixels, kSide, kSide, 32, kSide * 4 * sizeof(float), space,
+        kCGBitmapFloatComponents | kCGBitmapByteOrder32Host | (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    gSystemTiled(c, CGRectMake(0, 0, kSide, kSide), image);
+    unsigned char *out = malloc(kSide * kSide * 4);
+    // Bitmap rows run top down, as the surface's do.
+    for (size_t i = 0; i < (size_t)kSide * kSide; i++) {
+        static const int bgra[4] = { 2, 1, 0, 3 };
+        for (int k = 0; k < 4; k++) {
+            float v = pixels[i * 4 + bgra[k]] * 255;
+            out[i * 4 + k] = (unsigned char)(v < 0 ? 0 : v > 255 ? 255 : v + 0.5f);
+        }
+    }
+    CGContextRelease(c);
+    free(pixels);
+    return out;
+}
+
+// Whether `a` and `b` are byte-identical but for pixel 0's alpha, which may round to 0 or 1 when `zeroed`: the
+// zeroed pixel's float match keeps an alpha of 0x00ff / 0xffff * 255 = 0.97, which the archive's 8-bit copy
+// holds as 0.
+static bool sameBytes(const unsigned char *a, const unsigned char *b, bool zeroed)
+{
+    for (size_t i = 0; i < (size_t)kSide * kSide * 4; i++) {
+        bool pixelZeroAlpha = zeroed && i == 3;
+        if (pixelZeroAlpha ? a[i] > 1 || b[i] > 1 : a[i] != b[i])
+            return false;
+    }
+    return true;
 }
 
 // 8-bit RGBA (big-endian: R,G,B,A). pixel0 gets (r,g,b,a); the rest opaque grey.
@@ -161,13 +196,15 @@ int main(int argc, char **argv)
     check(childSurvives(argv[0], 0), "16-bit RGBA, alpha 0x00ff, tiled: replacement prevents the crash");
     check(childSurvives(argv[0], 1), "8-bit grey+alpha, alpha 0, tiled: replacement prevents the crash");
 
-    // Correctness: the replacement's draw of a poisoned image equals 10.9's draw of the zeroed image.
+    // Correctness: the replacement's draw of a poisoned image is the exact match of the zeroed image. The
+    // archive matches a tiled image into another colour space itself, onto the exact match; 10.9's accelerated
+    // renderer lands grey 0x8000 at Adobe RGB 128 where it is 126.5.
     {
         CGImageRef poison = make16RGBA(0x8000, 0x8000, 0x8000, 0x00ff);
         CGImageRef zeroed = make16RGBA(0, 0, 0, 0x00ff);
         unsigned char *viaArchive = tileToSurface(CGContextDrawTiledImage, gAdobe, poison);
-        unsigned char *viaZeroed = tileToSurface(gSystemTiled, gAdobe, zeroed);
-        check(!memcmp(viaArchive, viaZeroed, kSide * kSide * 4), "16-bit RGBA alpha 0x00ff: archive draw equals 10.9's draw of the zeroed image");
+        unsigned char *viaZeroed = tileExactly(gAdobe, zeroed);
+        check(sameBytes(viaArchive, viaZeroed, true), "16-bit RGBA alpha 0x00ff: archive draw is the zeroed image's exact match");
         free(viaArchive); free(viaZeroed); CGImageRelease(poison); CGImageRelease(zeroed);
     }
 
@@ -200,8 +237,8 @@ int main(int argc, char **argv)
     {
         CGImageRef image = make16RGBA(0x8000, 0x8000, 0x8000, 0x1000);
         unsigned char *viaArchive = tileToSurface(CGContextDrawTiledImage, gAdobe, image);
-        unsigned char *viaSystem = tileToSurface(gSystemTiled, gAdobe, image);
-        check(!memcmp(viaArchive, viaSystem, kSide * kSide * 4), "16-bit colour 0x8000 over alpha 0x1000: byte-identical to 10.9");
+        unsigned char *viaSystem = tileExactly(gAdobe, image);
+        check(sameBytes(viaArchive, viaSystem, false), "16-bit colour 0x8000 over alpha 0x1000: the exact match");
         free(viaArchive); free(viaSystem); CGImageRelease(image);
     }
     // 16-bit alpha 0x00ff colour 0x1000: no crash on stock, and equals the zeroed draw.
@@ -209,8 +246,8 @@ int main(int argc, char **argv)
         CGImageRef poison = make16RGBA(0x1000, 0x1000, 0x1000, 0x00ff);
         CGImageRef zeroed = make16RGBA(0, 0, 0, 0x00ff);
         unsigned char *viaArchive = tileToSurface(CGContextDrawTiledImage, gAdobe, poison);
-        unsigned char *viaZeroed = tileToSurface(gSystemTiled, gAdobe, zeroed);
-        check(!memcmp(viaArchive, viaZeroed, kSide * kSide * 4), "16-bit alpha 0x00ff colour 0x1000: archive draw equals 10.9's zeroed draw");
+        unsigned char *viaZeroed = tileExactly(gAdobe, zeroed);
+        check(sameBytes(viaArchive, viaZeroed, true), "16-bit alpha 0x00ff colour 0x1000: the zeroed image's exact match");
         free(viaArchive); free(viaZeroed); CGImageRelease(poison); CGImageRelease(zeroed);
     }
 
@@ -226,8 +263,8 @@ int main(int argc, char **argv)
         CGDataProviderRelease(d);
         if (image) {
             unsigned char *viaArchive = tileToSurface(CGContextDrawTiledImage, gAdobe, image);
-            unsigned char *viaSystem = tileToSurface(gSystemTiled, gAdobe, image);
-            check(!memcmp(viaArchive, viaSystem, kSide * kSide * 4), "decode-array image: byte-identical to 10.9 (passed through)");
+            unsigned char *viaSystem = tileExactly(gAdobe, image);
+            check(sameBytes(viaArchive, viaSystem, false), "decode-array image: the exact match");
             free(viaArchive); free(viaSystem); CGImageRelease(image);
         } else check(0, "decode-array image could be created");
     }

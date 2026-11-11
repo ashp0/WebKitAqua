@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 CGContextRef CGIOSurfaceContextCreate(IOSurfaceRef, size_t, size_t, size_t, size_t, CGColorSpaceRef, CGBitmapInfo);
 CGImageRef CGIOSurfaceContextCreateImage(CGContextRef);
@@ -41,19 +42,17 @@ static DrawImageFn systemDrawImage(void)
     return found ? (DrawImageFn)NSAddressOfSymbol(found) : 0;
 }
 
-// The system's count of IOSurface objects, from ioclasscount, or -1.
+// This process's live IOSurfaces: 10.9 gives a process's surfaces IDs from 1 up, reusing freed ones, and
+// IOSurfaceLookup finds a surface of this process by its ID.
 static long surfaceCount(void)
 {
-    FILE *pipe = popen("/usr/sbin/ioclasscount IOSurface", "r");
-    long count = -1;
-    if (pipe) {
-        char line[256];
-        if (fgets(line, sizeof line, pipe)) {
-            char *equals = strchr(line, '=');
-            if (equals)
-                count = strtol(equals + 1, NULL, 10);
+    long count = 0;
+    for (IOSurfaceID surfaceID = 1; surfaceID < 65536; surfaceID++) {
+        IOSurfaceRef surface = IOSurfaceLookup(surfaceID);
+        if (surface) {
+            count++;
+            CFRelease(surface);
         }
-        pclose(pipe);
     }
     return count;
 }
@@ -234,15 +233,15 @@ int main(void)
     CFRelease(source);
 
     // An image 20000 rows tall, over the software renderer's texture limit, each row encoding its number, drawn
-    // one to one showing 4 rows and, under the accelerated renderer, 16000, within the tallest surface it draws
-    // into: the destination holds exactly those image rows, and they survive the image's surface being overwritten
-    // before the destination renders. The software renderer draws such an image whole, from its surface.
+    // one to one showing 4 rows and 16000, within the tallest surface the accelerated renderer draws into: the
+    // destination holds exactly those image rows, and they survive the image's surface being overwritten before
+    // the destination renders.
     {
         enum { kWide = 8, kTall = 20000, kFirst = 2500 };
         IOSurfaceRef tall = createSurface(kWide, kTall);
         CGContextRef tallContext = CGIOSurfaceContextCreate(tall, kWide, kTall, 8, 32, sRGB, kBGRA);
         static const size_t shownRows[] = { 4, 16000 };
-        for (size_t s = 0; s < (accelerated ? 2 : 1); s++) {
+        for (size_t s = 0; s < 2; s++) {
             size_t shown = shownRows[s];
             IOSurfaceLock(tall, 0, NULL);
             for (size_t y = 0; y < kTall; y++) {
@@ -262,11 +261,9 @@ int main(void)
             // Image row kFirst + r lies along destination row r counted from the top.
             CGContextDrawImage(context, CGRectMake(0, (CGFloat)shown + kFirst - kTall, kWide, kTall), image);
             CGImageRelease(image);
-            if (accelerated) {
-                IOSurfaceLock(tall, 0, NULL);
-                memset(IOSurfaceGetBaseAddress(tall), 0x80, IOSurfaceGetAllocSize(tall));
-                IOSurfaceUnlock(tall, 0, NULL);
-            }
+            IOSurfaceLock(tall, 0, NULL);
+            memset(IOSurfaceGetBaseAddress(tall), 0x80, IOSurfaceGetAllocSize(tall));
+            IOSurfaceUnlock(tall, 0, NULL);
             CGContextFlush(context);
             size_t wrongRows = 0;
             IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
@@ -291,7 +288,8 @@ int main(void)
     }
 
     // 2000 one-to-one draws, each copying a part into a surface of its own, leave no surfaces behind once their
-    // destinations are rendered and released: the system's count of IOSurface objects grows by fewer than 100.
+    // destinations are rendered and released: once QuartzCore has let go of what it renders, this process holds
+    // fewer than 10 more IOSurfaces than before them.
     {
         IOSurfaceRef source = createSurface(kImageWidth, kImageHeight);
         fillSurface(source, kImageWidth, kImageHeight, false);
@@ -309,8 +307,15 @@ int main(void)
             CFRelease(surface);
         }
         long after = surfaceCount();
+        for (int wait = 0; wait < 30; wait++) {
+            usleep(100000);
+            long now = surfaceCount();
+            if (now >= after)
+                break;
+            after = now;
+        }
         printf("    IOSurface objects before %ld, after 2000 draws %ld\n", before, after);
-        check(before >= 0 && after >= 0 && after - before < 100, "parts copied for one-to-one draws are released with their draws");
+        check(before >= 0 && after >= 0 && after - before < 10, "parts copied for one-to-one draws are released with their draws");
         CGContextRelease(sourceContext);
         CFRelease(source);
     }

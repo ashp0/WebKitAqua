@@ -420,9 +420,21 @@ probe_cg_iosurface_image_matching() {
 }
 
 probe_cg_iosurface_image_part() {
-    "$CLANG" $MODERN $INC -Wno-four-char-constants -o "$T/cg_iosurface_image_part" \
+    "$CLANG" $MODERN -dynamiclib -DWK_PROBE_SOFTWARE_RENDERER -o "$T/software_renderer.dylib" \
+        "$TBEHAV/CoreGraphics-iosurface-row-placement.c" -framework OpenGL &&
+        "$CLANG" $MODERN $INC -Wno-four-char-constants -o "$T/cg_iosurface_image_part" \
         "$TBEHAV/CoreGraphics-iosurface-image-part.c" $PROBE_LIBS -framework CoreGraphics -framework IOSurface &&
-        "$T/cg_iosurface_image_part"
+        "$T/cg_iosurface_image_part" &&
+        DYLD_INSERT_LIBRARIES="$T/software_renderer.dylib" "$T/cg_iosurface_image_part"
+}
+
+probe_cg_iosurface_row_placement() {
+    "$CLANG" $MODERN -dynamiclib -DWK_PROBE_SOFTWARE_RENDERER -o "$T/software_renderer.dylib" \
+        "$TBEHAV/CoreGraphics-iosurface-row-placement.c" -framework OpenGL &&
+        "$CLANG" $MODERN $INC -Wno-four-char-constants -o "$T/cg_iosurface_row_placement" \
+        "$TBEHAV/CoreGraphics-iosurface-row-placement.c" $PROBE_LIBS -framework CoreGraphics -framework IOSurface &&
+        "$T/cg_iosurface_row_placement" &&
+        DYLD_INSERT_LIBRARIES="$T/software_renderer.dylib" "$T/cg_iosurface_row_placement"
 }
 
 probe_cg_gradient_dither_space() {
@@ -1283,6 +1295,7 @@ run_probe ax_client_identification "$@"
 run_probe cg_iosurface_image_colorspace "$@"
 run_probe cg_iosurface_image_matching "$@"
 run_probe cg_iosurface_image_part "$@"
+run_probe cg_iosurface_row_placement "$@"
 run_probe cg_gradient_dither_space "$@"
 run_probe cg_radial_coinciding "$@"
 run_probe cg_radial_iosurface "$@"

@@ -8,7 +8,7 @@
 // under global alpha and the multiply blend mode, a shadow, a linear-sRGB gradient, and a transparency layer;
 // QuartzCore antialiases the clip's edge in its own way. Each blend mode that changes the destination beneath a
 // transparent source leaves pixels the gradient does not cover untouched, in a surface and in an 8-bit bitmap of
-// another colour space, and 64 draws leave them byte-exact; under a shadow as well a surface holds 10.9's own draw into a surface, or for plus-darker within three levels of the bitmap's. A
+// another colour space, and 64 draws leave them byte-exact; under a shadow as well a surface holds 10.9's own draw into a surface off the antialiased edges of the gradient's circles, or for plus-darker within three levels of the bitmap's. A
 // bitmap under a shadow is 10.9's own draw. A surface wider than one band holds, with a shadow and under the
 // copy blend mode too. A gray gradient holds, a gray surface takes the route, a singular CTM paints nothing, and
 // an asymmetric hard-stop gradient in an asynchronously drawing layer lands where it belongs at contents scales
@@ -28,6 +28,22 @@ typedef void (*DrawRadialFn)(CGContextRef, CGGradientRef, CGPoint, CGFloat, CGPo
 typedef void (*DrawLinearFn)(CGContextRef, CGGradientRef, CGPoint, CGPoint, CGGradientDrawingOptions);
 
 static const CGBitmapInfo kBGRA = (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little;
+
+// `bgra`, an sRGB colour, as CoreGraphics matches it into a BGRA pixel of `space`, as the window server matches
+// a window of sRGB onto the display a screenshot is taken in.
+static void colourInSpace(CGColorSpaceRef space, const unsigned char bgra[4], unsigned char out[4])
+{
+    CGColorSpaceRef sRGB = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    const CGFloat components[4] = { bgra[2] / 255.0, bgra[1] / 255.0, bgra[0] / 255.0, bgra[3] / 255.0 };
+    CGColorRef colour = CGColorCreate(sRGB, components);
+    CGContextRef pixel = CGBitmapContextCreate(out, 1, 1, 8, 4, space, kBGRA);
+    CGContextSetFillColorWithColor(pixel, colour);
+    CGContextSetBlendMode(pixel, kCGBlendModeCopy);
+    CGContextFillRect(pixel, CGRectMake(0, 0, 1, 1));
+    CGContextRelease(pixel);
+    CGColorRelease(colour);
+    CGColorSpaceRelease(sRGB);
+}
 static const CGGradientDrawingOptions kBoth = kCGGradientDrawsBeforeStartLocation | kCGGradientDrawsAfterEndLocation;
 
 static int failures;
@@ -220,6 +236,24 @@ static void checkScene(Scene scene, const char *name, bool baselineIsSurface, do
     readTarget(&surface);
     readTarget(&baseline);
     int largest = largestDifference(&surface, &baseline, sceneTransform(), inset);
+    // 10.9's accelerated renderer leaves out some pixels along the antialiased edges of a gradient that does not
+    // extend, which CoreGraphics and the software renderer cover: against its surface draw the partial scene is
+    // compared off the device pixels within a scene unit of its circles, r = 10 and r = 30 about (50, 50).
+    if (baselineIsSurface && scene.partial) {
+        CGAffineTransform toScene = CGAffineTransformInvert(sceneTransform());
+        largest = 0;
+        for (size_t row = 0; row < kSide; row++) {
+            for (size_t x = 0; x < kSide; x++) {
+                CGPoint point = CGPointApplyAffineTransform(CGPointMake(x + 0.5, kSide - row - 0.5), toScene);
+                double distance = hypot(point.x - 50, point.y - 50);
+                if (fabs(distance - 10) < 1 || fabs(distance - 30) < 1)
+                    continue;
+                const unsigned char *p = surface.pixels + (row * kSide + x) * 4, *q = baseline.pixels + (row * kSide + x) * 4;
+                for (int c = 0; c < 4; c++)
+                    largest = MAX(largest, abs(p[c] - q[c]));
+            }
+        }
+    }
     char what[200];
     snprintf(what, sizeof(what), "%s: within %d of 10.9's %s draw (largest %d)", name, tolerance, baselineIsSurface ? "surface" : "bitmap", largest);
     check(largest <= tolerance, what);
@@ -594,7 +628,13 @@ int main(void)
                 kCGWindowImageBoundsIgnoreFraming | kCGWindowImageNominalResolution);
             int wrong = -1;
             if (shot && CGImageGetWidth(shot) == kLayerWidth && CGImageGetHeight(shot) == kLayerHeight) {
-                CGContextRef bitmap = CGBitmapContextCreate(NULL, kLayerWidth, kLayerHeight, 8, kLayerWidth * 4, gSRGB, kBGRA);
+                // Compared in the screenshot's colour space: a display narrower than sRGB has no sRGB red to return.
+                CGColorSpaceRef screen = CGImageGetColorSpace(shot);
+                static const unsigned char sRGBRed[4] = { 0, 0, 255, 255 }, sRGBBlue[4] = { 255, 0, 0, 255 };
+                unsigned char red[4], blue[4];
+                colourInSpace(screen, sRGBRed, red);
+                colourInSpace(screen, sRGBBlue, blue);
+                CGContextRef bitmap = CGBitmapContextCreate(NULL, kLayerWidth, kLayerHeight, 8, kLayerWidth * 4, screen, kBGRA);
                 CGContextDrawImage(bitmap, CGRectMake(0, 0, kLayerWidth, kLayerHeight), shot);
                 const unsigned char *pixels = CGBitmapContextGetData(bitmap);
                 wrong = 0;
@@ -604,7 +644,8 @@ int main(void)
                         if (fabs(distance - kHardRadius) < 2)
                             continue;
                         const unsigned char *pixel = pixels + (row * kLayerWidth + x) * 4;
-                        wrong += (distance < kHardRadius ? pixel[2] < 245 || pixel[0] > 10 : pixel[0] < 245 || pixel[2] > 10) || pixel[1] > 10;
+                        const unsigned char *expected = distance < kHardRadius ? red : blue;
+                        wrong += abs(pixel[0] - expected[0]) > 10 || abs(pixel[1] - expected[1]) > 10 || abs(pixel[2] - expected[2]) > 10;
                     }
                 }
                 CGContextRelease(bitmap);
