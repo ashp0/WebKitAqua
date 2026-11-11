@@ -2712,6 +2712,81 @@ WK_POLYFILL_REPLACES("CoreGraphics", CGImageRef, CGIOSurfaceContextCreateImage, 
     return image;
 }
 
+// Releasing an IOSurface context makes QuartzCore detach the context's images a destination still holds, reading its
+// surface back, and each new context and surface costs a window-server round trip besides the one QuartzCore makes
+// for every queue it builds after a flush, kept context or not. Up to four part contexts of at most a megapixel are
+// kept for reuse, keyed by size and colour space: at most 16 MB of IOSurface per process, for its life. The parts a
+// canvas repaint repeats are the canvas's rows in the page's tiles, which on a vertically scrolling page are as wide as
+// the view and 512 device pixels tall: one width and at most three heights (the top edge, whole tiles, the bottom
+// edge), each within a megapixel for a canvas up to 2048 pixels wide. Drawing into a kept context again detaches any
+// image of it a destination still holds.
+typedef struct {
+    size_t width, height;
+    CGColorSpaceRef colorSpace;
+    IOSurfaceRef surface;
+    CGContextRef context;
+} wk_part_context;
+enum { wk_partContextCount = 4 };
+static const size_t wk_partContextMaximumPixels = 1024 * 1024;
+static wk_part_context wk_partContexts[wk_partContextCount];
+static size_t wk_partContextNext;
+static pthread_mutex_t wk_partContextsLock = PTHREAD_MUTEX_INITIALIZER;
+
+static wk_part_context wk_takePartContext(size_t width, size_t height, CGColorSpaceRef colorSpace)
+{
+    wk_part_context part = { width, height, NULL, NULL, NULL };
+    pthread_mutex_lock(&wk_partContextsLock);
+    for (size_t i = 0; i < wk_partContextCount; i++) {
+        wk_part_context *kept = &wk_partContexts[i];
+        if (kept->context && kept->width == width && kept->height == height && CFEqual(kept->colorSpace, colorSpace)) {
+            part = *kept;
+            *kept = (wk_part_context) { 0, 0, NULL, NULL, NULL };
+            break;
+        }
+    }
+    pthread_mutex_unlock(&wk_partContextsLock);
+    if (part.context)
+        return part;
+    part.surface = wk_createBGRASurface(width, height);
+    part.context = part.surface ? CGIOSurfaceContextCreate(part.surface, width, height, 8, 32, colorSpace, wk_bgraInfo) : NULL;
+    if (!part.context)
+        return part;
+    part.colorSpace = CGColorSpaceRetain(colorSpace);
+    CGContextSetBlendMode(part.context, kCGBlendModeCopy);
+    CGContextSetInterpolationQuality(part.context, kCGInterpolationNone);
+    return part;
+}
+
+static void wk_releasePartContext(wk_part_context part)
+{
+    if (part.context)
+        CGContextRelease(part.context);
+    if (part.surface)
+        CFRelease(part.surface);
+    if (part.colorSpace)
+        CGColorSpaceRelease(part.colorSpace);
+}
+
+static void wk_returnPartContext(wk_part_context part)
+{
+    if (!part.context || part.width * part.height > wk_partContextMaximumPixels) {
+        wk_releasePartContext(part);
+        return;
+    }
+    pthread_mutex_lock(&wk_partContextsLock);
+    size_t slot = wk_partContextCount;
+    for (size_t i = 0; i < wk_partContextCount && slot == wk_partContextCount; i++) {
+        if (!wk_partContexts[i].context)
+            slot = i;
+    }
+    if (slot == wk_partContextCount)
+        slot = wk_partContextNext++ % wk_partContextCount;
+    wk_part_context evicted = wk_partContexts[slot];
+    wk_partContexts[slot] = part;
+    pthread_mutex_unlock(&wk_partContextsLock);
+    wk_releasePartContext(evicted);
+}
+
 // What `image` paints from pixel `left`, `top` to `right`, `bottom`, copied one to one by QuartzCore, which reads
 // an image of an IOSurface context from its surface, into an image of `colorSpace` of its own -- of the image's
 // own space, or sRGB, when `colorSpace` is not RGB -- or NULL. Under the
@@ -2729,12 +2804,11 @@ static CGImageRef wk_copyImagePart(CGImageRef image, CGColorSpaceRef colorSpace,
         else if (!(colorSpace = sRGB = WK_SYSTEM(CGColorSpaceCreateWithName)(kCGColorSpaceSRGB)))
             return NULL;
     }
-    IOSurfaceRef surface = wk_createBGRASurface(partWidth, partHeight);
-    CGContextRef context = surface ? CGIOSurfaceContextCreate(surface, partWidth, partHeight, 8, 32, colorSpace, wk_bgraInfo) : NULL;
+    wk_part_context part = wk_takePartContext(partWidth, partHeight, colorSpace);
+    IOSurfaceRef surface = part.surface;
+    CGContextRef context = part.context;
     CGImageRef copy = NULL;
     if (context) {
-        CGContextSetBlendMode(context, kCGBlendModeCopy);
-        CGContextSetInterpolationQuality(context, kCGInterpolationNone);
         if (!wk_coreAnimationTextureLimit())
             WK_ORIGINAL(CGContextDrawImage)(context, CGRectMake(-left, bottom - height, width, height), image);
         else {
@@ -2770,10 +2844,8 @@ static CGImageRef wk_copyImagePart(CGImageRef image, CGColorSpaceRef colorSpace,
             }
             WK_SYSTEM(IOSurfaceUnlock)(surface, kIOSurfaceLockReadOnly, NULL);
         }
-        CGContextRelease(context);
     }
-    if (surface)
-        CFRelease(surface);
+    wk_returnPartContext(part);
     if (sRGB)
         CGColorSpaceRelease(sRGB);
     return copy;

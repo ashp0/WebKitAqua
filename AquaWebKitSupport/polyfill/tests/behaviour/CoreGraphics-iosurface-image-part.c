@@ -5,8 +5,9 @@
 // 10.9's own definition lands drawing the whole image. The cases: a rectangular clip with the image partly off
 // the surface, one at fractional bounds, a path clip, a clip along the image's edge, an alpha below one, a
 // multiply and a copy blend, and an image 20000 rows tall. A draw under a shadow, a
-// flipped draw and one at a half-pixel offset draw the whole image, and land what 10.9 lands. The parts copied
-// are released with their draws.
+// flipped draw and one at a half-pixel offset draw the whole image, and land what 10.9 lands. Two parts of one size
+// of different pixels, in destinations that render after both draws, land their own pixels. Part images are released
+// with their draws; at most four part surfaces are kept, also after parts of six sizes and parts over a megapixel.
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <IOSurface/IOSurface.h>
@@ -294,18 +295,73 @@ int main(void)
         IOSurfaceRef source = createSurface(kImageWidth, kImageHeight);
         fillSurface(source, kImageWidth, kImageHeight, false);
         CGContextRef sourceContext = CGIOSurfaceContextCreate(source, kImageWidth, kImageHeight, 8, 32, sRGB, kBGRA);
+        // A part drawn into one destination that has not rendered yet, then a part of the same size of other pixels
+        // into another: each destination lands its own part, as an at-once draw of the same pixels does.
+        {
+            unsigned char *landed[4];
+            for (int round = 0; round < 2; round++) {
+                CGContextRef contexts[2];
+                IOSurfaceRef surfaces[2];
+                for (int k = 0; k < 2; k++) {
+                    fillSurface(source, kImageWidth, kImageHeight, k == 1);
+                    CGImageRef image = CGIOSurfaceContextCreateImage(sourceContext);
+                    surfaces[k] = createSurface(64, 64);
+                    fillSurface(surfaces[k], 64, 64, true);
+                    contexts[k] = CGIOSurfaceContextCreate(surfaces[k], 64, 64, 8, 32, sRGB, kBGRA);
+                    CGContextClipToRect(contexts[k], CGRectMake(5, 7, 40, 30));
+                    CGContextDrawImage(contexts[k], CGRectMake(-10, -20, kImageWidth, kImageHeight), image);
+                    CGImageRelease(image);
+                    // Round 0 renders each destination at once; round 1 renders both after the second draw.
+                    if (round == 0)
+                        CGContextFlush(contexts[k]);
+                }
+                for (int k = 0; k < 2; k++) {
+                    CGContextFlush(contexts[k]);
+                    landed[round * 2 + k] = malloc(64 * 64 * 4);
+                    IOSurfaceLock(surfaces[k], kIOSurfaceLockReadOnly, NULL);
+                    for (size_t y = 0; y < 64; y++)
+                        memcpy(landed[round * 2 + k] + y * 64 * 4, (unsigned char *)IOSurfaceGetBaseAddress(surfaces[k]) + y * IOSurfaceGetBytesPerRow(surfaces[k]), 64 * 4);
+                    IOSurfaceUnlock(surfaces[k], kIOSurfaceLockReadOnly, NULL);
+                    CGContextRelease(contexts[k]);
+                    CFRelease(surfaces[k]);
+                }
+            }
+            size_t differ = 0;
+            for (size_t i = 0; i < 64 * 64 * 4; i++)
+                differ += (landed[0][i] != landed[2][i]) + (landed[1][i] != landed[3][i]);
+            char what[200];
+            snprintf(what, sizeof what, "two parts of one size in destinations rendered later land their own pixels (%zu bytes differ)", differ);
+            check(!differ, what);
+            for (int i = 0; i < 4; i++)
+                free(landed[i]);
+            fillSurface(source, kImageWidth, kImageHeight, false);
+        }
+
+        // Parts of six sizes in turn, more than are kept, and every 100th draw a part over a megapixel of a larger image.
+        IOSurfaceRef large = createSurface(1200, 1000);
+        fillSurface(large, 1200, 1000, false);
+        CGContextRef largeContext = CGIOSurfaceContextCreate(large, 1200, 1000, 8, 32, sRGB, kBGRA);
+        static const CGSize partSizes[] = { { 40, 30 }, { 41, 30 }, { 42, 31 }, { 30, 20 }, { 50, 40 }, { 44, 33 } };
         long before = surfaceCount();
         for (int i = 0; i < 2000; i++) {
-            CGImageRef image = CGIOSurfaceContextCreateImage(sourceContext);
-            IOSurfaceRef surface = createSurface(64, 64);
-            CGContextRef context = CGIOSurfaceContextCreate(surface, 64, 64, 8, 32, sRGB, kBGRA);
-            CGContextClipToRect(context, CGRectMake(5, 7, 40, 30));
-            CGContextDrawImage(context, CGRectMake(-(i % 300), -(i % 500), kImageWidth, kImageHeight), image);
+            bool largePart = i % 100 == 99;
+            CGImageRef image = CGIOSurfaceContextCreateImage(largePart ? largeContext : sourceContext);
+            size_t side = largePart ? 1200 : 64;
+            IOSurfaceRef surface = createSurface(side, side);
+            CGContextRef context = CGIOSurfaceContextCreate(surface, side, side, 8, 32, sRGB, kBGRA);
+            CGSize size = largePart ? CGSizeMake(1100, 990) : partSizes[i % 6];
+            CGContextClipToRect(context, CGRectMake(5, 7, size.width, size.height));
+            if (largePart)
+                CGContextDrawImage(context, CGRectMake(0, 0, 1200, 1000), image);
+            else
+                CGContextDrawImage(context, CGRectMake(-(i % 300), -(i % 500), kImageWidth, kImageHeight), image);
             CGImageRelease(image);
             CGContextFlush(context);
             CGContextRelease(context);
             CFRelease(surface);
         }
+        CGContextRelease(largeContext);
+        CFRelease(large);
         long after = surfaceCount();
         for (int wait = 0; wait < 30; wait++) {
             usleep(100000);
@@ -315,7 +371,7 @@ int main(void)
             after = now;
         }
         printf("    IOSurface objects before %ld, after 2000 draws %ld\n", before, after);
-        check(before >= 0 && after >= 0 && after - before < 10, "parts copied for one-to-one draws are released with their draws");
+        check(before >= 0 && after >= 0 && after - before <= 6, "part images are released with their draws; at most four part surfaces are kept");
         CGContextRelease(sourceContext);
         CFRelease(source);
     }
